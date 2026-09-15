@@ -1,0 +1,272 @@
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum UserRole {
+  BUYER
+  SUPPLIER
+  ADMIN
+}
+
+enum CompanyType {
+  BUYER
+  SUPPLIER
+}
+
+enum VerificationStatus {
+  PENDING
+  IN_REVIEW
+  VERIFIED
+  REJECTED
+}
+
+enum RFQStatus {
+  DRAFT
+  PUBLISHED
+  QUOTING_CLOSED
+  AWARDED
+  CANCELLED
+}
+
+enum QuoteStatus {
+  SUBMITTED
+  SHORTLISTED
+  AWARDED
+  REJECTED
+  WITHDRAWN
+}
+
+enum LPOStatus {
+  ISSUED
+  ACCEPTED
+  DECLINED
+  CANCELLED
+}
+
+enum OrderStatus {
+  CONFIRMED
+  IN_PROGRESS
+  SHIPPED
+  DELIVERED
+  COMPLETED
+  DISPUTED
+  CANCELLED
+}
+
+enum DeliveryStatus {
+  PENDING
+  DISPATCHED
+  IN_TRANSIT
+  DELIVERED
+  FAILED
+}
+
+enum InvoiceStatus {
+  ISSUED
+  PARTIALLY_PAID
+  PAID
+  OVERDUE
+  CANCELLED
+}
+
+enum PaymentStatus {
+  PENDING
+  COMPLETED
+  FAILED
+  REFUNDED
+}
+
+enum WalletTxType {
+  TOPUP
+  BID_DEBIT
+  REFUND
+  ADJUSTMENT
+}
+
+model User {
+  id           String   @id @default(uuid())
+  email        String   @unique
+  passwordHash String
+  role         UserRole
+  isActive     Boolean  @default(true)
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  company Company?
+}
+
+model Company {
+  id                 String              @id @default(uuid())
+  userId             String              @unique
+  user               User                @relation(fields: [userId], references: [id])
+  name               String
+  type               CompanyType
+  registrationNumber String?
+  country            String?
+  address            String?
+  phone              String?
+  verificationStatus VerificationStatus  @default(PENDING)
+  verificationNotes  String?
+  createdAt          DateTime            @default(now())
+  updatedAt          DateTime            @updatedAt
+
+  documents        CompanyDocument[]
+  wallet           Wallet?
+  rfqsAsBuyer      RFQ[]             @relation("BuyerRFQs")
+  quotesAsSupplier Quote[]           @relation("SupplierQuotes")
+  catalogItems     CatalogItem[]
+  lposAsBuyer      LPO[]             @relation("BuyerLPOs")
+  lposAsSupplier   LPO[]             @relation("SupplierLPOs")
+}
+
+model CompanyDocument {
+  id        String   @id @default(uuid())
+  companyId String
+  company   Company  @relation(fields: [companyId], references: [id])
+  fileUrl   String
+  docType   String
+  uploadedAt DateTime @default(now())
+}
+
+model Wallet {
+  id        String   @id @default(uuid())
+  companyId String   @unique
+  company   Company  @relation(fields: [companyId], references: [id])
+  balance   Decimal  @default(0) @db.Decimal(12, 2)
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  transactions WalletTransaction[]
+}
+
+model WalletTransaction {
+  id        String       @id @default(uuid())
+  walletId  String
+  wallet    Wallet       @relation(fields: [walletId], references: [id])
+  amount    Decimal      @db.Decimal(12, 2)
+  type      WalletTxType
+  reference String?
+  createdAt DateTime     @default(now())
+}
+
+model RFQ {
+  id             String    @id @default(uuid())
+  buyerCompanyId String
+  buyerCompany   Company   @relation("BuyerRFQs", fields: [buyerCompanyId], references: [id])
+  title          String
+  description    String
+  category       String?
+  quantity       Int?
+  unit           String?
+  deadline       DateTime?
+  status         RFQStatus @default(DRAFT)
+  createdAt      DateTime  @default(now())
+  updatedAt      DateTime  @updatedAt
+
+  quotes Quote[]
+  lpo    LPO?
+}
+
+model Quote {
+  id                 String      @id @default(uuid())
+  rfqId              String
+  rfq                RFQ         @relation(fields: [rfqId], references: [id])
+  supplierCompanyId  String
+  supplierCompany    Company     @relation("SupplierQuotes", fields: [supplierCompanyId], references: [id])
+  price              Decimal     @db.Decimal(12, 2)
+  currency           String      @default("BHD")
+  deliveryTimeDays   Int?
+  notes              String?
+  status             QuoteStatus @default(SUBMITTED)
+  createdAt          DateTime    @default(now())
+  updatedAt          DateTime    @updatedAt
+
+  lpo LPO?
+}
+
+model CatalogItem {
+  id                String   @id @default(uuid())
+  supplierCompanyId String
+  supplierCompany   Company  @relation(fields: [supplierCompanyId], references: [id])
+  name              String
+  description       String?
+  price             Decimal  @db.Decimal(12, 2)
+  unit              String?
+  category          String?
+  isActive          Boolean  @default(true)
+  createdAt         DateTime @default(now())
+  updatedAt         DateTime @updatedAt
+}
+
+model LPO {
+  id                 String    @id @default(uuid())
+  rfqId              String    @unique
+  rfq                RFQ       @relation(fields: [rfqId], references: [id])
+  quoteId            String    @unique
+  quote              Quote     @relation(fields: [quoteId], references: [id])
+  buyerCompanyId     String
+  buyerCompany       Company   @relation("BuyerLPOs", fields: [buyerCompanyId], references: [id])
+  supplierCompanyId  String
+  supplierCompany    Company   @relation("SupplierLPOs", fields: [supplierCompanyId], references: [id])
+  terms              String?
+  totalAmount        Decimal   @db.Decimal(12, 2)
+  status             LPOStatus @default(ISSUED)
+  createdAt          DateTime  @default(now())
+  updatedAt          DateTime  @updatedAt
+
+  order Order?
+}
+
+model Order {
+  id        String      @id @default(uuid())
+  lpoId     String      @unique
+  lpo       LPO         @relation(fields: [lpoId], references: [id])
+  status    OrderStatus @default(CONFIRMED)
+  createdAt DateTime    @default(now())
+  updatedAt DateTime    @updatedAt
+
+  delivery Delivery?
+  invoice  Invoice?
+}
+
+model Delivery {
+  id             String         @id @default(uuid())
+  orderId        String         @unique
+  order          Order          @relation(fields: [orderId], references: [id])
+  status         DeliveryStatus @default(PENDING)
+  trackingInfo   String?
+  dispatchedAt   DateTime?
+  deliveredAt    DateTime?
+  notes          String?
+  createdAt      DateTime       @default(now())
+  updatedAt      DateTime       @updatedAt
+}
+
+model Invoice {
+  id          String        @id @default(uuid())
+  orderId     String        @unique
+  order       Order         @relation(fields: [orderId], references: [id])
+  amount      Decimal       @db.Decimal(12, 2)
+  status      InvoiceStatus @default(ISSUED)
+  dueDate     DateTime?
+  issuedAt    DateTime      @default(now())
+  updatedAt   DateTime      @updatedAt
+
+  payments Payment[]
+}
+
+model Payment {
+  id        String        @id @default(uuid())
+  invoiceId String
+  invoice   Invoice       @relation(fields: [invoiceId], references: [id])
+  amount    Decimal       @db.Decimal(12, 2)
+  method    String?
+  status    PaymentStatus @default(PENDING)
+  paidAt    DateTime?
+  createdAt DateTime      @default(now())
+}
