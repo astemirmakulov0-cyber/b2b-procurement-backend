@@ -122,6 +122,8 @@ model Company {
   catalogItems     CatalogItem[]
   lposAsBuyer      LPO[]             @relation("BuyerLPOs")
   lposAsSupplier   LPO[]             @relation("SupplierLPOs")
+  messages         Message[]
+  notifications    Notification[]
 }
 
 model CompanyDocument {
@@ -232,6 +234,7 @@ model Order {
 
   delivery Delivery?
   invoice  Invoice?
+  messages Message[]
 }
 
 model Delivery {
@@ -269,4 +272,26 @@ model Payment {
   status    PaymentStatus @default(PENDING)
   paidAt    DateTime?
   createdAt DateTime      @default(now())
+}
+
+model Message {
+  id               String   @id @default(uuid())
+  orderId          String
+  order            Order    @relation(fields: [orderId], references: [id])
+  senderCompanyId  String
+  senderCompany    Company  @relation(fields: [senderCompanyId], references: [id])
+  body             String
+  createdAt        DateTime @default(now())
+}
+
+model Notification {
+  id             String   @id @default(uuid())
+  companyId      String
+  company        Company  @relation(fields: [companyId], references: [id])
+  type           String
+  title          String
+  body           String?
+  relatedOrderId String?
+  read           Boolean  @default(false)
+  createdAt      DateTime @default(now())
 }

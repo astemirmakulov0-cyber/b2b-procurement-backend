@@ -1,5 +1,6 @@
 const prisma = require('../config/prisma');
 const asyncHandler = require('../utils/asyncHandler');
+const { notify } = require('../utils/notify');
 
 const BID_CREDIT_COST = 1.0; // cost per quote submission, adjust as needed
 
@@ -47,6 +48,7 @@ const submitQuote = asyncHandler(async (req, res) => {
   });
 
   res.status(201).json(result);
+  notify(rfq.buyerCompanyId, 'NEW_QUOTE', 'New quote received', 'A supplier submitted a quote on "' + rfq.title + '"');
 });
 
 // GET /api/rfqs/:rfqId/quotes  (buyer, owner) - compare offers

@@ -1,5 +1,6 @@
 const prisma = require('../config/prisma');
 const asyncHandler = require('../utils/asyncHandler');
+const { notify } = require('../utils/notify');
 
 // GET /api/invoices
 const listInvoices = asyncHandler(async (req, res) => {
@@ -64,6 +65,7 @@ const recordPayment = asyncHandler(async (req, res) => {
   });
 
   res.status(201).json(result);
+  notify(invoice.order.lpo.supplierCompanyId, 'PAYMENT', 'Payment received', amount + ' received on invoice.', invoice.orderId);
 });
 
 module.exports = { listInvoices, getInvoice, recordPayment };

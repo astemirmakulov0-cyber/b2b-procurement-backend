@@ -1,5 +1,6 @@
 const prisma = require('../config/prisma');
 const asyncHandler = require('../utils/asyncHandler');
+const { notify } = require('../utils/notify');
 
 async function loadOrderWithAccessCheck(orderId, user) {
   const order = await prisma.order.findUnique({
@@ -71,6 +72,8 @@ const updateDelivery = asyncHandler(async (req, res) => {
   }
 
   res.json(delivery);
+  const label = status === 'DISPATCHED' ? 'Your order has been dispatched' : status === 'DELIVERED' ? 'Your order has been delivered' : 'Delivery status updated';
+  notify(order.lpo.buyerCompanyId, 'DELIVERY', label, trackingInfo ? 'Tracking: ' + trackingInfo : undefined, order.id);
 });
 
 module.exports = { listOrders, getOrder, updateOrderStatus, updateDelivery };

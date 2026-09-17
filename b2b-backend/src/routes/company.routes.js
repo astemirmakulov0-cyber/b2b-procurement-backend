@@ -9,5 +9,6 @@ router.post('/companies/me/documents', authRequired, ctrl.addDocument);
 // Admin
 router.get('/admin/companies', authRequired, requireRole('ADMIN'), ctrl.listCompanies);
 router.patch('/admin/companies/:id/verify', authRequired, requireRole('ADMIN'), ctrl.setVerificationStatus);
+router.post('/admin/companies/:id/reset-password', authRequired, requireRole('ADMIN'), ctrl.resetCompanyPassword);
 
 module.exports = router;

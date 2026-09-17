@@ -1,5 +1,6 @@
 const prisma = require('../config/prisma');
 const asyncHandler = require('../utils/asyncHandler');
+const { notify } = require('../utils/notify');
 
 // POST /api/quotes/:id/award  (buyer) - awards the quote, closes RFQ, creates LPO + Order
 const awardQuote = asyncHandler(async (req, res) => {
@@ -35,6 +36,7 @@ const awardQuote = asyncHandler(async (req, res) => {
   });
 
   res.status(201).json(result);
+  notify(quote.supplierCompanyId, 'AWARDED', 'You won an order', 'Your quote on "' + quote.rfq.title + '" was awarded.');
 });
 
 // PATCH /api/lpos/:id/accept  (supplier) - supplier accepts LPO, creates Order
@@ -55,8 +57,8 @@ const acceptLPO = asyncHandler(async (req, res) => {
   });
 
   res.json(result);
+  notify(lpo.buyerCompanyId, 'ACCEPTED', 'Order confirmed', 'Your supplier accepted the purchase order.', result.order.id);
 });
-
 // PATCH /api/lpos/:id/decline  (supplier)
 const declineLPO = asyncHandler(async (req, res) => {
   const lpo = await prisma.lPO.findUnique({ where: { id: req.params.id } });

@@ -84,4 +84,23 @@ const me = asyncHandler(async (req, res) => {
   res.json({ id: user.id, email: user.email, role: user.role, company: user.company });
 });
 
-module.exports = { register, login, me };
+// PATCH /api/auth/password  (self-service, requires current password)
+const changePassword = asyncHandler(async (req, res) => {
+  const { currentPassword, newPassword } = req.body;
+  if (!currentPassword || !newPassword) {
+    return res.status(400).json({ error: 'currentPassword and newPassword are required' });
+  }
+  if (newPassword.length < 6) return res.status(400).json({ error: 'newPassword must be at least 6 characters' });
+
+  const user = await prisma.user.findUnique({ where: { id: req.user.id } });
+  if (!user) return res.status(404).json({ error: 'User not found' });
+
+  const valid = await bcrypt.compare(currentPassword, user.passwordHash);
+  if (!valid) return res.status(401).json({ error: 'Current password is incorrect' });
+
+  const passwordHash = await bcrypt.hash(newPassword, 10);
+  await prisma.user.update({ where: { id: user.id }, data: { passwordHash } });
+  res.json({ ok: true });
+});
+
+module.exports = { register, login, me, changePassword };

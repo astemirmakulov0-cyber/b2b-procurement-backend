@@ -1,5 +1,8 @@
 const prisma = require('../config/prisma');
+const bcrypt = require('bcryptjs');
+const crypto = require('crypto');
 const asyncHandler = require('../utils/asyncHandler');
+const { notify } = require('../utils/notify');
 
 // GET /api/companies/me
 const getMyCompany = asyncHandler(async (req, res) => {
@@ -57,7 +60,23 @@ const setVerificationStatus = asyncHandler(async (req, res) => {
     where: { id },
     data: { verificationStatus: status, verificationNotes: notes },
   });
+  if (status === 'VERIFIED' || status === 'REJECTED') {
+    notify(company.id, 'VERIFICATION', status === 'VERIFIED' ? 'Company verified' : 'Verification rejected', notes || undefined);
+  }
   res.json(company);
 });
 
-module.exports = { getMyCompany, updateMyCompany, addDocument, listCompanies, setVerificationStatus };
+// POST /api/admin/companies/:id/reset-password  -> generates a temp password and returns it once
+const resetCompanyPassword = asyncHandler(async (req, res) => {
+  const { id } = req.params;
+  const company = await prisma.company.findUnique({ where: { id } });
+  if (!company) return res.status(404).json({ error: 'Company not found' });
+
+  const tempPassword = crypto.randomBytes(6).toString('base64url'); // ~8 char random password
+  const passwordHash = await bcrypt.hash(tempPassword, 10);
+  await prisma.user.update({ where: { id: company.userId }, data: { passwordHash } });
+
+  res.json({ ok: true, tempPassword });
+});
+
+module.exports = { getMyCompany, updateMyCompany, addDocument, listCompanies, setVerificationStatus, resetCompanyPassword };
