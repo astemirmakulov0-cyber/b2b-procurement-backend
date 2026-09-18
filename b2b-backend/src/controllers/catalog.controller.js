@@ -3,11 +3,11 @@ const asyncHandler = require('../utils/asyncHandler');
 
 // POST /api/catalog  (supplier)
 const createItem = asyncHandler(async (req, res) => {
-  const { name, description, price, unit, category } = req.body;
+  const { name, description, price, unit, category, imageUrl } = req.body;
   if (!name || price === undefined) return res.status(400).json({ error: 'name and price required' });
 
   const item = await prisma.catalogItem.create({
-    data: { supplierCompanyId: req.user.companyId, name, description, price, unit, category },
+    data: { supplierCompanyId: req.user.companyId, name, description, price, unit, category, imageUrl },
   });
   res.status(201).json(item);
 });
