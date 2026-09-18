@@ -3,7 +3,7 @@ const asyncHandler = require('../utils/asyncHandler');
 
 // POST /api/rfqs  (buyer)
 const createRFQ = asyncHandler(async (req, res) => {
-  const { title, description, category, quantity, unit, deadline, publish } = req.body;
+  const { title, description, category, quantity, unit, deadline, publish, budget } = req.body;
   if (!title || !description) return res.status(400).json({ error: 'title and description required' });
 
   const rfq = await prisma.rFQ.create({
@@ -14,6 +14,7 @@ const createRFQ = asyncHandler(async (req, res) => {
       category,
       quantity,
       unit,
+      budget,
       deadline: deadline ? new Date(deadline) : null,
       status: publish ? 'PUBLISHED' : 'DRAFT',
     },

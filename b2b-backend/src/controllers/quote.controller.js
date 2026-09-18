@@ -2,9 +2,9 @@ const prisma = require('../config/prisma');
 const asyncHandler = require('../utils/asyncHandler');
 const { notify } = require('../utils/notify');
 
-const BID_CREDIT_COST = 1.0; // cost per quote submission, adjust as needed
+const BID_FEE_PERCENT = 0.05; // supplier pays 5% of the RFQ's budget to submit a quote
 
-// POST /api/rfqs/:rfqId/quotes  (supplier) - submits a bid, deducts bid credit from wallet
+// POST /api/rfqs/:rfqId/quotes  (supplier) - submits a bid, deducts 5% of RFQ budget from wallet
 const submitQuote = asyncHandler(async (req, res) => {
   const { rfqId } = req.params;
   const { price, currency, deliveryTimeDays, notes } = req.body;
@@ -14,21 +14,25 @@ const submitQuote = asyncHandler(async (req, res) => {
   if (!rfq || rfq.status !== 'PUBLISHED') {
     return res.status(400).json({ error: 'RFQ is not open for quotes' });
   }
+  if (!rfq.budget) {
+    return res.status(400).json({ error: 'This RFQ has no budget set — cannot calculate bid fee' });
+  }
+  const bidCost = Number(rfq.budget) * BID_FEE_PERCENT;
 
   const result = await prisma.$transaction(async (tx) => {
     const wallet = await tx.wallet.findUnique({ where: { companyId: req.user.companyId } });
-    if (!wallet || Number(wallet.balance) < BID_CREDIT_COST) {
+    if (!wallet || Number(wallet.balance) < bidCost) {
       throw Object.assign(new Error('Insufficient bid credits'), { status: 402 });
     }
 
     await tx.wallet.update({
       where: { id: wallet.id },
-      data: { balance: { decrement: BID_CREDIT_COST } },
+      data: { balance: { decrement: bidCost } },
     });
     await tx.walletTransaction.create({
       data: {
         walletId: wallet.id,
-        amount: -BID_CREDIT_COST,
+        amount: -bidCost,
         type: 'BID_DEBIT',
         reference: `RFQ ${rfqId}`,
       },
@@ -48,6 +52,7 @@ const submitQuote = asyncHandler(async (req, res) => {
   });
 
   res.status(201).json(result);
+});
   notify(rfq.buyerCompanyId, 'NEW_QUOTE', 'New quote received', 'A supplier submitted a quote on "' + rfq.title + '"');
 });
 

@@ -165,6 +165,7 @@ model RFQ {
   category       String?
   quantity       Int?
   unit           String?
+  budget         Decimal?  @db.Decimal(12, 2)
   deadline       DateTime?
   status         RFQStatus @default(DRAFT)
   createdAt      DateTime  @default(now())
