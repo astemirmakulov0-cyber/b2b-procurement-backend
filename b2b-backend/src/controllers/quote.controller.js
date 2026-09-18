@@ -53,8 +53,6 @@ const submitQuote = asyncHandler(async (req, res) => {
 
   res.status(201).json(result);
 });
-  notify(rfq.buyerCompanyId, 'NEW_QUOTE', 'New quote received', 'A supplier submitted a quote on "' + rfq.title + '"');
-});
 
 // GET /api/rfqs/:rfqId/quotes  (buyer, owner) - compare offers
 const listQuotesForRFQ = asyncHandler(async (req, res) => {
