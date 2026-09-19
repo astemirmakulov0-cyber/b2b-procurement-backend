@@ -14,7 +14,7 @@ function signToken(user, companyId) {
 // POST /api/auth/register
 // body: { email, password, role: 'BUYER'|'SUPPLIER', companyName, country }
 const register = asyncHandler(async (req, res) => {
-  const { email, password, role, companyName, country, phone, registrationNumber } = req.body;
+  const { email, password, role, companyName, country, phone, registrationNumber, consent } = req.body;
 
   if (!email || !password || !role || !companyName) {
     return res.status(400).json({ error: 'email, password, role and companyName are required' });
@@ -40,6 +40,7 @@ const register = asyncHandler(async (req, res) => {
           country,
           phone,
           registrationNumber,
+          consentAt: consent ? new Date() : null,
           wallet: { create: { balance: 0 } },
         },
       },
@@ -103,4 +104,19 @@ const changePassword = asyncHandler(async (req, res) => {
   res.json({ ok: true });
 });
 
-module.exports = { register, login, me, changePassword };
+// DELETE /api/auth/me  (soft-delete: deactivate own account)
+const deleteAccount = asyncHandler(async (req, res) => {
+  const user = await prisma.user.findUnique({ where: { id: req.user.id }, include: { company: true } });
+  if (!user) return res.status(404).json({ error: 'User not found' });
+
+  if (user.company) {
+    await prisma.company.update({
+      where: { id: user.company.id },
+      data: { isActive: false },
+    });
+  }
+
+  res.json({ ok: true, message: 'Account deactivated successfully' });
+});
+
+module.exports = { register, login, me, changePassword, deleteAccount };
