@@ -112,6 +112,8 @@ model Company {
   phone              String?
   verificationStatus VerificationStatus  @default(PENDING)
   verificationNotes  String?
+  consentAt          DateTime?           
+  isActive           Boolean             @default(true)
   createdAt          DateTime            @default(now())
   updatedAt          DateTime            @updatedAt
 
