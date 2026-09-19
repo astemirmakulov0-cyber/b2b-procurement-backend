@@ -124,6 +124,9 @@ model Company {
   lposAsSupplier   LPO[]             @relation("SupplierLPOs")
   messages         Message[]
   notifications    Notification[]
+  consentAt        DateTime?
+  isActive         Boolean           @default(true)
+
 }
 
 model CompanyDocument {
