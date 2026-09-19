@@ -10,6 +10,7 @@ const rfqRoutes = require('./routes/rfq.routes');
 const orderRoutes = require('./routes/order.routes');
 const catalogRoutes = require('./routes/catalog.routes');
 const errorHandler = require('./middleware/errorHandler');
+const rateLimit = require('express-rate-limit');
 
 const app = express();
 
@@ -17,6 +18,24 @@ app.use(helmet());
 app.use(cors());
 app.use(morgan('dev'));
 app.use(express.json({ limit: '10mb' }));
+const apiLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 200,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'Too many requests, please try again later.' }
+});
+app.use('/api', apiLimiter);
+
+const authLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 10,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'Too many login attempts, please try again later.' }
+});
+app.use('/api/auth/login', authLimiter);
+app.use('/api/auth/register', authLimiter);
 
 app.get('/api/health', (req, res) => res.json({ status: 'ok' }));
 
