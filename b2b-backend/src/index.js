@@ -15,7 +15,14 @@ const rateLimit = require('express-rate-limit');
 const app = express();
 
 app.use(helmet());
-app.use(cors());
+app.use(cors({
+  origin: [
+    'https://biddex.online',
+    'https://app.biddex.online',
+    'https://www.biddex.online'
+  ],
+  credentials: true
+}));
 app.use(morgan('dev'));
 app.use(express.json({ limit: '10mb' }));
 const apiLimiter = rateLimit({
