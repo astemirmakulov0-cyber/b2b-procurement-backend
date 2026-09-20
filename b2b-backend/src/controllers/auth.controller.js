@@ -67,14 +67,10 @@ const register = asyncHandler(async (req, res) => {
   });
 
   await sendVerificationEmail(email, verificationToken);
-  const token = signToken(user, user.company.id);
   res.status(201).json({
-    token,
-    user: { id: user.id, email: user.email, role: user.role },
-    company: user.company,
-    message: 'Registration successful. Please check your email to verify your account.',
-  });
+  message: 'Registration successful. Please check your email to verify your account before logging in.',
 });
+ 
 
 // POST /api/auth/login
 const login = asyncHandler(async (req, res) => {
