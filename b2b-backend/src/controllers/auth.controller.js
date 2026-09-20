@@ -70,7 +70,7 @@ const register = asyncHandler(async (req, res) => {
   res.status(201).json({
   message: 'Registration successful. Please check your email to verify your account before logging in.',
 });
- 
+}); 
 
 // POST /api/auth/login
 const login = asyncHandler(async (req, res) => {
