@@ -9,7 +9,7 @@ const resend = new Resend(process.env.RESEND_API_KEY);
 async function sendVerificationEmail(email, token) {
   const verifyUrl = (process.env.FRONTEND_URL || 'http://localhost') + '/verify.html?token=' + token;
   await resend.emails.send({
-    from: 'Biddex <onboarding@resend.dev>',
+    from: 'Biddex <noreply@biddex.online>',
     to: email,
     subject: 'Verify your Biddex account',
     html: '<p>Welcome to Biddex. Please verify your email by clicking the link below:</p><p><a href="' + verifyUrl + '">Verify my email</a></p><p>This link expires in 24 hours.</p>'
