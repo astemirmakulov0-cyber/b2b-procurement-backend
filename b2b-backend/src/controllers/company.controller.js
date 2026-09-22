@@ -79,4 +79,45 @@ const resetCompanyPassword = asyncHandler(async (req, res) => {
   res.json({ ok: true, tempPassword });
 });
 
-module.exports = { getMyCompany, updateMyCompany, addDocument, listCompanies, setVerificationStatus, resetCompanyPassword };
+// DELETE /api/admin/companies/:id  — permanently deletes the company, its user, and everything linked to it
+const deleteCompany = asyncHandler(async (req, res) => {
+  const { id } = req.params;
+  const company = await prisma.company.findUnique({ where: { id } });
+  if (!company) return res.status(404).json({ error: 'Company not found' });
+
+  await prisma.$transaction(async (tx) => {
+    const lpos = await tx.lPO.findMany({
+      where: { OR: [{ buyerCompanyId: id }, { supplierCompanyId: id }] },
+      include: { order: true },
+    });
+    const orderIds = lpos.filter(l => l.order).map(l => l.order.id);
+
+    if (orderIds.length) {
+      await tx.payment.deleteMany({ where: { invoice: { orderId: { in: orderIds } } } });
+      await tx.invoice.deleteMany({ where: { orderId: { in: orderIds } } });
+      await tx.delivery.deleteMany({ where: { orderId: { in: orderIds } } });
+      await tx.message.deleteMany({ where: { orderId: { in: orderIds } } });
+      await tx.order.deleteMany({ where: { id: { in: orderIds } } });
+    }
+
+    await tx.lPO.deleteMany({ where: { OR: [{ buyerCompanyId: id }, { supplierCompanyId: id }] } });
+    await tx.quote.deleteMany({ where: { OR: [{ supplierCompanyId: id }, { rfq: { buyerCompanyId: id } }] } });
+    await tx.rFQ.deleteMany({ where: { buyerCompanyId: id } });
+    await tx.catalogItem.deleteMany({ where: { supplierCompanyId: id } });
+    await tx.companyDocument.deleteMany({ where: { companyId: id } });
+    await tx.notification.deleteMany({ where: { companyId: id } });
+
+    const wallet = await tx.wallet.findUnique({ where: { companyId: id } });
+    if (wallet) {
+      await tx.walletTransaction.deleteMany({ where: { walletId: wallet.id } });
+      await tx.wallet.delete({ where: { id: wallet.id } });
+    }
+
+    await tx.company.delete({ where: { id } });
+    await tx.user.delete({ where: { id: company.userId } });
+  });
+
+  res.json({ ok: true, message: 'Company and all related data permanently deleted' });
+});
+
+module.exports = { getMyCompany, updateMyCompany, addDocument, listCompanies, setVerificationStatus, resetCompanyPassword, deleteCompany };
