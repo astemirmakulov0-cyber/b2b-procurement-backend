@@ -1,8 +1,13 @@
 const prisma = require('../config/prisma');
 const asyncHandler = require('../utils/asyncHandler');
 
-// POST /api/rfqs  (buyer)
+// POST /api/rfqs  (buyer, must be verified)
 const createRFQ = asyncHandler(async (req, res) => {
+  const company = await prisma.company.findUnique({ where: { id: req.user.companyId } });
+  if (!company || company.verificationStatus !== 'VERIFIED') {
+    return res.status(403).json({ error: 'Your company must be verified before posting RFQs' });
+  }
+
   const { title, description, category, quantity, unit, deadline, publish, budget } = req.body;
   if (!title || !description) return res.status(400).json({ error: 'title and description required' });
 
@@ -52,6 +57,29 @@ const getRFQ = asyncHandler(async (req, res) => {
     },
   });
   if (!rfq) return res.status(404).json({ error: 'RFQ not found' });
+
+  if (req.user.role === 'BUYER') {
+    if (rfq.buyerCompanyId !== req.user.companyId) {
+      return res.status(403).json({ error: 'Not your RFQ' });
+    }
+  } else if (req.user.role === 'SUPPLIER') {
+    const ownQuote = rfq.quotes.find(q => q.supplierCompanyId === req.user.companyId);
+
+    // suppliers can only see RFQs that are open, or ones they've already quoted on
+    if (rfq.status !== 'PUBLISHED' && !ownQuote) {
+      return res.status(403).json({ error: 'RFQ not available' });
+    }
+
+    // hide the buyer's identity until this supplier's quote has been awarded
+    const isAwarded = ownQuote && ownQuote.status === 'AWARDED';
+    if (!isAwarded) {
+      rfq.buyerCompany = { id: rfq.buyerCompany.id, name: 'Hidden until awarded' };
+    }
+
+    // never expose competitors' quotes on this endpoint
+    rfq.quotes = ownQuote ? [ownQuote] : [];
+  }
+
   res.json(rfq);
 });
 

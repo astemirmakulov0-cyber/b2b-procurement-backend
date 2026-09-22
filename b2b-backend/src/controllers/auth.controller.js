@@ -147,6 +147,12 @@ const verifyEmail = asyncHandler(async (req, res) => {
   const user = await prisma.user.findUnique({ where: { verificationToken: token } });
   if (!user) return res.status(400).json({ error: 'Invalid or expired token' });
 
+  // Idempotent: if an email scanner already "clicked" this link, the real
+  // user's click should still succeed instead of hitting a stale token.
+  if (user.emailVerified) {
+    return res.json({ ok: true, message: 'Email already verified' });
+  }
+
   if (user.verificationExpires && user.verificationExpires < new Date()) {
     return res.status(400).json({ error: 'Token has expired' });
   }
@@ -155,8 +161,6 @@ const verifyEmail = asyncHandler(async (req, res) => {
     where: { id: user.id },
     data: {
       emailVerified: true,
-      verificationToken: null,
-      verificationExpires: null,
     },
   });
 

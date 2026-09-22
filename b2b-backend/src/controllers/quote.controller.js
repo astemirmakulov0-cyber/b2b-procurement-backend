@@ -4,8 +4,13 @@ const { notify } = require('../utils/notify');
 
 const BID_FEE_PERCENT = 0.05; // supplier pays 5% of the RFQ's budget to submit a quote
 
-// POST /api/rfqs/:rfqId/quotes  (supplier) - submits a bid, deducts 5% of RFQ budget from wallet
+// POST /api/rfqs/:rfqId/quotes  (supplier, must be verified) - submits a bid, deducts 5% of RFQ budget from wallet
 const submitQuote = asyncHandler(async (req, res) => {
+  const company = await prisma.company.findUnique({ where: { id: req.user.companyId } });
+  if (!company || company.verificationStatus !== 'VERIFIED') {
+    return res.status(403).json({ error: 'Your company must be verified before submitting quotes' });
+  }
+
   const { rfqId } = req.params;
   const { price, currency, deliveryTimeDays, notes } = req.body;
   if (!price) return res.status(400).json({ error: 'price required' });
@@ -54,15 +59,22 @@ const submitQuote = asyncHandler(async (req, res) => {
   res.status(201).json(result);
 });
 
-// GET /api/rfqs/:rfqId/quotes  (buyer, owner) - compare offers
+// GET /api/rfqs/:rfqId/quotes  (buyer sees all offers to compare; supplier sees only their own)
 const listQuotesForRFQ = asyncHandler(async (req, res) => {
   const rfq = await prisma.rFQ.findUnique({ where: { id: req.params.rfqId } });
   if (!rfq) return res.status(404).json({ error: 'RFQ not found' });
   if (req.user.role === 'BUYER' && rfq.buyerCompanyId !== req.user.companyId) {
     return res.status(403).json({ error: 'Not your RFQ' });
   }
+
+  const where = { rfqId: req.params.rfqId };
+  if (req.user.role === 'SUPPLIER') {
+    // suppliers must never see competitors' pricing on the same RFQ
+    where.supplierCompanyId = req.user.companyId;
+  }
+
   const quotes = await prisma.quote.findMany({
-    where: { rfqId: req.params.rfqId },
+    where,
     include: { supplierCompany: { select: { id: true, name: true, verificationStatus: true } } },
     orderBy: { price: 'asc' },
   });
