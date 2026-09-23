@@ -48,12 +48,23 @@ app.use('/api', apiLimiter);
 const authLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
   max: 10,
+  // only failed attempts count, so a team logging in from one office IP isn't locked out
+  skipSuccessfulRequests: true,
   standardHeaders: true,
   legacyHeaders: false,
   message: { error: 'Too many login attempts, please try again later.' }
 });
 app.use('/api/auth/login', authLimiter);
-app.use('/api/auth/register', authLimiter);
+
+// Separate from authLimiter: successful registrations must still count, since each one sends an email
+const registerLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  max: 10,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'Too many registration attempts, please try again later.' }
+});
+app.use('/api/auth/register', registerLimiter);
 
 const forgotPasswordLimiter = rateLimit({
   windowMs: 60 * 60 * 1000,
