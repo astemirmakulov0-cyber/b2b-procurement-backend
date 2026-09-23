@@ -70,10 +70,26 @@ const updateOrderStatus = asyncHandler(async (req, res) => {
     if (paid) return res.status(400).json({ error: 'Cannot cancel an order that has payments' });
   }
 
-  // Only apply if nobody changed the status since we read it
-  const { count } = await prisma.order.updateMany({ where: { id: order.id, status: order.status }, data: { status } });
-  if (count === 0) return res.status(409).json({ error: 'Order status changed meanwhile; reload and try again' });
-  const updated = await prisma.order.findUnique({ where: { id: order.id } });
+  const updated = await prisma.$transaction(async (tx) => {
+    // Only apply if nobody changed the status since we read it
+    const { count } = await tx.order.updateMany({ where: { id: order.id, status: order.status }, data: { status } });
+    if (count === 0) throw Object.assign(new Error('Order status changed meanwhile; reload and try again'), { status: 409 });
+    if (status === 'CANCELLED' && order.invoice) {
+      // same lock as payments, so no payment can be reported/confirmed while the invoice is being closed
+      await tx.$queryRaw`SELECT id FROM "Invoice" WHERE id = ${order.invoice.id} FOR UPDATE`;
+      if (isSupplier && await tx.payment.count({ where: { invoiceId: order.invoice.id, status: 'COMPLETED' } }) > 0) {
+        throw Object.assign(new Error('Cannot cancel an order that has payments'), { status: 400 });
+      }
+      await tx.payment.updateMany({
+        where: { invoiceId: order.invoice.id, status: 'PENDING' },
+        data: { status: 'FAILED', decidedAt: new Date(), rejectReason: 'Order cancelled' },
+      });
+      // an invoice with confirmed money on it is kept as is (refunds are handled outside the platform)
+      const confirmed = await tx.payment.count({ where: { invoiceId: order.invoice.id, status: 'COMPLETED' } });
+      if (confirmed === 0) await tx.invoice.update({ where: { id: order.invoice.id }, data: { status: 'CANCELLED' } });
+    }
+    return tx.order.findUnique({ where: { id: order.id } });
+  });
   res.json(updated);
 
   const other = isBuyer ? order.lpo.supplierCompanyId : order.lpo.buyerCompanyId;

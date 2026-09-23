@@ -308,7 +308,9 @@ async function newRfq(budget = 500, extra = {}) {
   check('delivery -> DELIVERED -> 200, order DELIVERED', (await call('PATCH', `/orders/${order1.id}/delivery`, S2, { status: 'DELIVERED' })).status === 200 && (await ordStatus()) === 'DELIVERED');
   check('delivery backwards DELIVERED -> DISPATCHED -> 400', (await call('PATCH', `/orders/${order1.id}/delivery`, S2, { status: 'DISPATCHED' })).status === 400);
   const inv1 = await db.invoice.findUnique({ where: { orderId: order1.id } });
-  check('full payment -> 201, order COMPLETED', (await call('POST', `/invoices/${inv1.id}/payments`, B1, { amount: Number(inv1.amount), method: 'bank_transfer' })).status === 201 && (await ordStatus()) === 'COMPLETED');
+  r = await call('POST', `/invoices/${inv1.id}/payments`, B1, { amount: Number(inv1.amount), method: 'bank_transfer' });
+  check('full payment reported -> 201 PENDING, order not completed yet', r.status === 201 && r.data.payment.status === 'PENDING' && (await ordStatus()) === 'DELIVERED', r.data);
+  check('supplier confirms -> order COMPLETED', (await call('PATCH', `/payments/${r.data.payment.id}/confirm`, S2, {})).status === 200 && (await ordStatus()) === 'COMPLETED');
   check('supplier cannot cancel COMPLETED -> 400', (await st(S2, 'CANCELLED')).status === 400);
   check('buyer cannot dispute COMPLETED -> 400', (await st(B1, 'DISPUTED')).status === 400);
   if (final3.status === 'ACCEPTED') {
@@ -318,7 +320,104 @@ async function newRfq(budget = 500, extra = {}) {
     check('payment on cancelled order -> 400', (await call('POST', `/invoices/${inv3.id}/payments`, B1, { amount: 1 })).status === 400);
   }
 
-  console.log('\n== 11. L1 errors -> 4xx ==');
+  console.log('\n== 11. C6/M10/M14 payments: report -> supplier confirms/rejects ==');
+  // helper: RFQ -> quote by sup -> award -> accept, returns { order, invoice }
+  async function makeOrder(price, supTok, supId, buyerTok = B1) {
+    await db.wallet.update({ where: { companyId: supId }, data: { balance: 1000 } });
+    const rf = (await call('POST', '/rfqs', buyerTok, { title: 'Pay ' + price, description: 'x', budget: 100, deadline: future(), publish: true })).data;
+    await call('POST', `/rfqs/${rf.id}/quotes`, supTok, { price });
+    const q = await db.quote.findFirst({ where: { rfqId: rf.id } });
+    await call('POST', `/quotes/${q.id}/award`, buyerTok, {});
+    const l = await db.lPO.findFirst({ where: { rfqId: rf.id } });
+    const acc = await call('PATCH', `/lpos/${l.id}/accept`, supTok);
+    return { order: acc.data.order, invoice: await db.invoice.findUnique({ where: { orderId: acc.data.order.id } }), rfq: rf };
+  }
+  const { order: po, invoice: pinv } = await makeOrder(100, S2, 'sup2');
+  const pay = (body, tokn = B1) => call('POST', `/invoices/${pinv.id}/payments`, tokn, body);
+  const invNow = async () => db.invoice.findUnique({ where: { id: pinv.id } });
+  const poStatus = async () => (await db.order.findUnique({ where: { id: po.id } })).status;
+  for (const [bad, why] of [[{ amount: -5, method: 'cash' }, 'negative'], [{ amount: 0, method: 'cash' }, 'zero'], [{ amount: '50', method: 'cash' }, 'string'],
+    [{ amount: 10.001, method: 'cash' }, '3 decimals'], [{ amount: 10, method: 'bitcoin' }, 'bad method'], [{ amount: 10, method: 'cash', reference: 'x'.repeat(101) }, 'long reference']]) {
+    check(`report payment ${why} -> 400`, (await pay(bad)).status === 400);
+  }
+  check('supplier cannot report a payment -> 403', (await pay({ amount: 10, method: 'cash' }, S2)).status === 403);
+  check('other buyer -> 403', (await pay({ amount: 10, method: 'cash' }, B2)).status === 403);
+  r = await pay({ amount: 150, method: 'cash' });
+  check('amount above outstanding 100 -> 400', r.status === 400 && /100\.00/.test(r.data.error), r.data);
+  r = await pay({ amount: 40, method: 'bank_transfer', reference: 'BBK-1' });
+  const p40 = r.data.payment;
+  check('report 40 -> 201 PENDING with reference; invoice still ISSUED', r.status === 201 && p40.status === 'PENDING' && p40.reference === 'BBK-1' && (await invNow()).status === 'ISSUED', r.data);
+  check('pending counts against outstanding: 70 -> 400', (await pay({ amount: 70, method: 'cash' })).status === 400);
+  const p60 = (await pay({ amount: 60, method: 'cheque', reference: 'CHQ-9' })).data.payment;
+  r = await pay({ amount: 1, method: 'cash' });
+  check('nothing left while rest is pending -> 400', r.status === 400 && /awaiting/.test(r.data.error), r.data);
+  check('buyer cannot confirm -> 403', (await call('PATCH', `/payments/${p40.id}/confirm`, B1, {})).status === 403);
+  check('other supplier cannot confirm -> 403', (await call('PATCH', `/payments/${p40.id}/confirm`, S1, {})).status === 403);
+  r = await call('PATCH', `/payments/${p60.id}/reject`, S2, { reason: 'Cheque bounced' });
+  check('supplier rejects 60 -> FAILED with reason; invoice still ISSUED', r.status === 200 && r.data.status === 'FAILED' && r.data.rejectReason === 'Cheque bounced' && (await invNow()).status === 'ISSUED', r.data);
+  check('reject again -> 400', (await call('PATCH', `/payments/${p60.id}/reject`, S2, {})).status === 400);
+  check('confirm a rejected payment -> 400', (await call('PATCH', `/payments/${p60.id}/confirm`, S2, {})).status === 400);
+  check('buyer notified of rejection', (await db.notification.count({ where: { companyId: 'buyer1', type: 'PAYMENT_REJECTED', body: { contains: 'Cheque bounced' } } })) === 1);
+  r = await call('PATCH', `/payments/${p40.id}/confirm`, S2, {});
+  check('confirm 40 -> invoice PARTIALLY_PAID, order not completed', r.status === 200 && r.data.invoice.status === 'PARTIALLY_PAID' && (await poStatus()) === 'CONFIRMED', r.data.invoice);
+
+  // M10: three parallel reports of 30 with 60 outstanding -> exactly two accepted
+  const par = await Promise.all([1, 2, 3].map(() => pay({ amount: 30, method: 'cash' })));
+  const pcodes = par.map((x) => x.status).sort();
+  const pend = await db.payment.aggregate({ where: { invoiceId: pinv.id, status: 'PENDING' }, _sum: { amount: true } });
+  check('3 parallel reports of 30 (60 open) -> 201,201,400 and pending = 60', pcodes.join() === '201,201,400' && Number(pend._sum.amount) === 60, { pcodes, pending: pend._sum.amount });
+  const ids = par.filter((x) => x.status === 201).map((x) => x.data.payment.id);
+  const conf = await Promise.all(ids.map((id) => call('PATCH', `/payments/${id}/confirm`, S2, {})));
+  const invEnd = await invNow();
+  const paidSum = await db.payment.aggregate({ where: { invoiceId: pinv.id, status: 'COMPLETED' }, _sum: { amount: true } });
+  check('parallel confirms -> both 200, paid 100, invoice PAID, order COMPLETED', conf.every((x) => x.status === 200) && Number(paidSum._sum.amount) === 100 && invEnd.status === 'PAID' && (await poStatus()) === 'COMPLETED', { codes: conf.map((x) => x.status), paid: paidSum._sum.amount, inv: invEnd.status });
+  r = await pay({ amount: 1, method: 'cash' });
+  check('pay a PAID invoice -> 400', r.status === 400 && /already paid/.test(r.data.error), r.data);
+
+  // order cancelled with a pending payment -> payment FAILED, invoice CANCELLED, no more payments
+  const { order: co, invoice: cinv } = await makeOrder(50, S2, 'sup2');
+  const pp = (await call('POST', `/invoices/${cinv.id}/payments`, B1, { amount: 20, method: 'cash' })).data.payment;
+  check('supplier cancels order with only a pending payment -> 200', (await call('PATCH', `/orders/${co.id}/status`, S2, { status: 'CANCELLED' })).status === 200);
+  const ppAfter = await db.payment.findUnique({ where: { id: pp.id } });
+  check('pending payment -> FAILED "Order cancelled", invoice CANCELLED', ppAfter.status === 'FAILED' && ppAfter.rejectReason === 'Order cancelled' && (await db.invoice.findUnique({ where: { id: cinv.id } })).status === 'CANCELLED');
+  check('pay a CANCELLED invoice -> 400', (await call('POST', `/invoices/${cinv.id}/payments`, B1, { amount: 5, method: 'cash' })).status === 400);
+  check('confirm payment of cancelled invoice -> 400', (await call('PATCH', `/payments/${pp.id}/confirm`, S2, {})).status === 400);
+  const { order: ko, invoice: kinv } = await makeOrder(50, S2, 'sup2');
+  const kp = (await call('POST', `/invoices/${kinv.id}/payments`, B1, { amount: 10, method: 'cash' })).data.payment;
+  await call('PATCH', `/payments/${kp.id}/confirm`, S2, {});
+  check('supplier cannot cancel order with a confirmed payment -> 400', (await call('PATCH', `/orders/${ko.id}/status`, S2, { status: 'CANCELLED' })).status === 400);
+
+  console.log('\n== 12. L7 admin delete keeps counterparties\' records ==');
+  const mkCo = async (id, role, balance = 0) => db.user.create({ data: { id: 'u-' + id, email: id + '@t.test', passwordHash: await bcrypt.hash('pw123456', 4), role, emailVerified: true,
+    company: { create: { id, name: 'Co ' + id, type: role, verificationStatus: 'VERIFIED', phone: '+973 1', registrationNumber: 'CR-' + id, wallet: { create: { balance } } } } } });
+  await mkCo('buyer5', 'BUYER'); await mkCo('sup5', 'SUPPLIER', 1000);
+  const B5 = tok('BUYER', 'buyer5'), S5 = tok('SUPPLIER', 'sup5');
+  const { order: o5, invoice: i5 } = await makeOrder(80, S5, 'sup5', B5);
+  const p5 = (await call('POST', `/invoices/${i5.id}/payments`, B5, { amount: 80, method: 'bank_transfer' })).data.payment;
+  await call('PATCH', `/payments/${p5.id}/confirm`, S5, {});
+  await db.wallet.update({ where: { companyId: 'sup1' }, data: { balance: 100 } });
+  const open5 = (await call('POST', '/rfqs', B5, { title: 'buyer5 open', description: 'x', budget: 200, deadline: future(), publish: true })).data;
+  await call('POST', `/rfqs/${open5.id}/quotes`, S1, { price: 150 }); // sup1 pays 10
+  r = await call('DELETE', '/admin/companies/buyer5', ADM);
+  check('delete buyer5 with trading history -> anonymized', r.status === 200 && r.data.mode === 'anonymized', r.data);
+  const b5 = await db.company.findUnique({ where: { id: 'buyer5' }, include: { user: true } });
+  check('buyer5 anonymized + deactivated', b5 && b5.name === 'Deleted company' && !b5.isActive && b5.phone === null && b5.registrationNumber === null && b5.user.email.endsWith('@deleted.invalid') && !b5.user.isActive);
+  check('order, invoice, confirmed payment kept', !!(await db.order.findUnique({ where: { id: o5.id } })) && (await db.invoice.findUnique({ where: { id: i5.id } })).status === 'PAID' && (await db.payment.findUnique({ where: { id: p5.id } })).status === 'COMPLETED');
+  check('counterparty sup5 still opens the order', (await call('GET', `/orders/${o5.id}`, S5)).status === 200);
+  check('sup1 refunded for buyer5 open RFQ', (await bal('sup1')) === 100 && (await db.rFQ.findUnique({ where: { id: open5.id } })).status === 'CANCELLED');
+  check('deleted buyer cannot log in', (await call('POST', '/auth/login', null, { email: 'buyer5@t.test', password: 'pw123456' })).status === 401);
+
+  await mkCo('sup6', 'SUPPLIER', 100); const S6 = tok('SUPPLIER', 'sup6');
+  const r6 = await newRfq(100);
+  await call('POST', `/rfqs/${r6.id}/quotes`, S6, { price: 90 });
+  await call('POST', `/rfqs/${r6.id}/quotes`, S1, { price: 95 });
+  await call('POST', '/catalog', S6, { name: 'sup6 item', price: 3 });
+  r = await call('DELETE', '/admin/companies/sup6', ADM);
+  check('delete sup6 without trading history -> deleted', r.status === 200 && r.data.mode === 'deleted', r.data);
+  check('sup6 rows gone', !(await db.company.findUnique({ where: { id: 'sup6' } })) && !(await db.user.findUnique({ where: { id: 'u-sup6' } })) && (await db.catalogItem.count({ where: { name: 'sup6 item' } })) === 0);
+  check('other supplier\'s quote on the same RFQ untouched', (await db.quote.count({ where: { rfqId: r6.id, supplierCompanyId: 'sup1' } })) === 1);
+
+  console.log('\n== 13. L1 errors -> 4xx ==');
   r = await call('GET', '/rfqs?status=FOO', B1);
   check('invalid RFQ status filter -> 400', r.status === 400 && /status must be one of/.test(r.data.error), r.data);
   check('invalid admin status filter -> 400', (await call('GET', '/admin/companies?status=FOO', ADM)).status === 400);
@@ -331,7 +430,7 @@ async function newRfq(budget = 500, extra = {}) {
   r = await call('PATCH', '/companies/me', ADM, { name: 'x' });
   check('admin without company PATCH /companies/me -> 4xx, not 500', r.status >= 400 && r.status < 500, r);
 
-  console.log('\n== 12. transaction timeout defaults ==');
+  console.log('\n== 14. transaction timeout defaults ==');
   const appPrisma = require(path.join(root, 'src/config/prisma'));
   const t0 = Date.now();
   try {

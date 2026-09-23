@@ -25,6 +25,8 @@ router.post('/orders/:orderId/messages', authRequired, messageCtrl.sendMessage);
 router.get('/invoices', authRequired, paymentCtrl.listInvoices);
 router.get('/invoices/:id', authRequired, paymentCtrl.getInvoice);
 router.post('/invoices/:id/payments', authRequired, requireRole('BUYER'), paymentCtrl.recordPayment);
+router.patch('/payments/:id/confirm', authRequired, requireRole('SUPPLIER'), paymentCtrl.confirmPayment);
+router.patch('/payments/:id/reject', authRequired, requireRole('SUPPLIER'), paymentCtrl.rejectPayment);
 
 // Notifications
 router.get('/notifications', authRequired, notificationCtrl.listNotifications);

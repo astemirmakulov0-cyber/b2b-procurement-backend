@@ -288,8 +288,13 @@ model Payment {
   invoice   Invoice       @relation(fields: [invoiceId], references: [id])
   amount    Decimal       @db.Decimal(12, 2)
   method    String?
+  // buyer-reported transfer/cheque/receipt number
+  reference String?
+  // PENDING until the supplier confirms (COMPLETED) or rejects (FAILED) it
   status    PaymentStatus @default(PENDING)
   paidAt    DateTime?
+  decidedAt DateTime?
+  rejectReason String?
   createdAt DateTime      @default(now())
 }
 

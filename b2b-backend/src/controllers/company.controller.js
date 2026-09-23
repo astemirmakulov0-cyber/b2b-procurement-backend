@@ -3,6 +3,7 @@ const bcrypt = require('bcryptjs');
 const crypto = require('crypto');
 const asyncHandler = require('../utils/asyncHandler');
 const { notify } = require('../utils/notify');
+const { CANCELLABLE_STATUSES, cancelRfqInTx } = require('../utils/rfqCancel');
 
 // GET /api/companies/me
 const getMyCompany = asyncHandler(async (req, res) => {
@@ -83,45 +84,67 @@ const resetCompanyPassword = asyncHandler(async (req, res) => {
   res.json({ ok: true, tempPassword });
 });
 
-// DELETE /api/admin/companies/:id  — permanently deletes the company, its user, and everything linked to it
+// DELETE /api/admin/companies/:id
+// Without purchase orders involving other companies: permanently deletes the company, its user and its data.
+// With them: keeps those shared records and deactivates + anonymizes the company instead (see below).
 const deleteCompany = asyncHandler(async (req, res) => {
   const { id } = req.params;
   const company = await prisma.company.findUnique({ where: { id } });
   if (!company) return res.status(404).json({ error: 'Company not found' });
 
-  await prisma.$transaction(async (tx) => {
-    const lpos = await tx.lPO.findMany({
-      where: { OR: [{ buyerCompanyId: id }, { supplierCompanyId: id }] },
-      include: { order: true },
-    });
-    const orderIds = lpos.filter(l => l.order).map(l => l.order.id);
-
-    if (orderIds.length) {
-      await tx.payment.deleteMany({ where: { invoice: { orderId: { in: orderIds } } } });
-      await tx.invoice.deleteMany({ where: { orderId: { in: orderIds } } });
-      await tx.delivery.deleteMany({ where: { orderId: { in: orderIds } } });
-      await tx.message.deleteMany({ where: { orderId: { in: orderIds } } });
-      await tx.order.deleteMany({ where: { id: { in: orderIds } } });
+  const mode = await prisma.$transaction(async (tx) => {
+    // Other suppliers paid to quote on this company's open RFQs: cancel them with refunds first
+    const openRfqs = await tx.rFQ.findMany({ where: { buyerCompanyId: id, status: { in: CANCELLABLE_STATUSES } }, select: { id: true } });
+    for (const { id: rfqId } of openRfqs) {
+      await tx.$queryRaw`SELECT id FROM "RFQ" WHERE id = ${rfqId} FOR UPDATE`;
+      const rfq = await tx.rFQ.findUnique({ where: { id: rfqId } });
+      if (CANCELLABLE_STATUSES.includes(rfq.status)) await cancelRfqInTx(tx, rfq);
     }
+    await tx.quote.updateMany({ where: { supplierCompanyId: id, status: { in: ['SUBMITTED', 'SHORTLISTED'] } }, data: { status: 'WITHDRAWN' } });
 
-    await tx.lPO.deleteMany({ where: { OR: [{ buyerCompanyId: id }, { supplierCompanyId: id }] } });
-    await tx.quote.deleteMany({ where: { OR: [{ supplierCompanyId: id }, { rfq: { buyerCompanyId: id } }] } });
-    await tx.rFQ.deleteMany({ where: { buyerCompanyId: id } });
     await tx.catalogItem.deleteMany({ where: { supplierCompanyId: id } });
     await tx.companyDocument.deleteMany({ where: { companyId: id } });
     await tx.notification.deleteMany({ where: { companyId: id } });
 
+    const tradedWithOthers = await tx.lPO.count({ where: { OR: [{ buyerCompanyId: id }, { supplierCompanyId: id }] } });
+    if (tradedWithOthers > 0) {
+      // Purchase orders, orders, invoices, payments and messages are also the counterparties' records,
+      // so they stay. The company is deactivated and stripped of personal/contact data instead.
+      await tx.company.update({
+        where: { id },
+        data: { isActive: false, name: 'Deleted company', registrationNumber: null, country: null, address: null, phone: null, verificationNotes: null },
+      });
+      await tx.user.update({
+        where: { id: company.userId },
+        data: {
+          isActive: false, email: `deleted-${company.userId}@deleted.invalid`, passwordHash: '!',
+          verificationToken: null, verificationExpires: null, resetToken: null, resetExpires: null,
+        },
+      });
+      return 'anonymized';
+    }
+
+    // No shared trading history: remove everything that belongs to this company only
+    const ownRfqIds = (await tx.rFQ.findMany({ where: { buyerCompanyId: id }, select: { id: true } })).map((r) => r.id);
+    await tx.quote.deleteMany({ where: { OR: [{ supplierCompanyId: id }, { rfqId: { in: ownRfqIds } }] } });
+    await tx.rFQ.deleteMany({ where: { buyerCompanyId: id } });
     const wallet = await tx.wallet.findUnique({ where: { companyId: id } });
     if (wallet) {
       await tx.walletTransaction.deleteMany({ where: { walletId: wallet.id } });
       await tx.wallet.delete({ where: { id: wallet.id } });
     }
-
     await tx.company.delete({ where: { id } });
     await tx.user.delete({ where: { id: company.userId } });
+    return 'deleted';
   });
 
-  res.json({ ok: true, message: 'Company and all related data permanently deleted' });
+  res.json({
+    ok: true,
+    mode,
+    message: mode === 'deleted'
+      ? 'Company and all related data permanently deleted'
+      : 'Company deactivated and anonymized; orders, invoices and payments shared with other companies were kept',
+  });
 });
 
 module.exports = { getMyCompany, updateMyCompany, addDocument, listCompanies, setVerificationStatus, resetCompanyPassword, deleteCompany };
