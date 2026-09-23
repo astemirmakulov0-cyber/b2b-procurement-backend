@@ -53,11 +53,6 @@ app.use('/api/auth/register', authLimiter);
 
 app.get('/api/health', (req, res) => res.json({ status: 'ok' }));
 
-// TEMP: Sentry test route, remove after verifying
-app.get('/api/debug-sentry', () => {
-  throw new Error('Sentry test error');
-});
-
 app.use('/api/auth', authRoutes);
 app.use('/api', companyRoutes);
 app.use('/api', rfqRoutes);
