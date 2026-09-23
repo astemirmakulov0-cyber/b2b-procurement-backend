@@ -20,6 +20,9 @@ const errorHandler = require('./middleware/errorHandler');
 const rateLimit = require('express-rate-limit');
 
 const app = express();
+// Railway's edge proxy sits in front of the app; trust one hop so req.ip is the client IP
+// (otherwise rate limits key on rotating internal proxy IPs and never trigger).
+app.set('trust proxy', 1);
 
 app.use(helmet());
 app.use(cors({
@@ -34,7 +37,7 @@ app.use(morgan('dev'));
 app.use(express.json({ limit: '10mb' }));
 const apiLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
-  max: 200,
+  max: 1000,
   standardHeaders: true,
   legacyHeaders: false,
   message: { error: 'Too many requests, please try again later.' }
