@@ -20,23 +20,10 @@ const errorHandler = require('./middleware/errorHandler');
 const rateLimit = require('express-rate-limit');
 
 const app = express();
-// Railway's edge proxy sits in front of the app; trust one hop so req.ip is the client IP
-// (otherwise rate limits key on rotating internal proxy IPs and never trigger).
-app.set('trust proxy', 1);
-
-// TEMP: diagnose which proxy hops Railway adds, to pick the right trust proxy setting. Remove after.
-app.use('/api/health', (req, res, next) => {
-  console.log('[ip-debug]', JSON.stringify({
-    url: req.originalUrl,
-    ip: req.ip,
-    ips: req.ips,
-    xff: req.headers['x-forwarded-for'],
-    xRealIp: req.headers['x-real-ip'],
-    envoyExternal: req.headers['x-envoy-external-address'],
-    remote: req.socket.remoteAddress,
-  }));
-  next();
-});
+// Railway rewrites X-Forwarded-For to "<client IP>, <Railway edge IP>" and then connects through
+// one more internal proxy, so trust two hops to make req.ip the real client IP for rate limiting.
+// Don't use X-Envoy-External-Address: Railway passes client-supplied values through unchanged.
+app.set('trust proxy', 2);
 
 app.use(helmet());
 app.use(cors({
