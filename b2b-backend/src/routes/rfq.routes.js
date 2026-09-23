@@ -8,6 +8,7 @@ router.post('/rfqs', authRequired, requireRole('BUYER'), rfqCtrl.createRFQ);
 router.get('/rfqs', authRequired, rfqCtrl.listRFQs);
 router.get('/rfqs/:id', authRequired, rfqCtrl.getRFQ);
 router.patch('/rfqs/:id', authRequired, requireRole('BUYER'), rfqCtrl.updateRFQ);
+router.post('/rfqs/:id/cancel', authRequired, requireRole('BUYER'), rfqCtrl.cancelRFQ);
 
 router.post('/rfqs/:rfqId/quotes', authRequired, requireRole('SUPPLIER'), quoteCtrl.submitQuote);
 router.get('/rfqs/:rfqId/quotes', authRequired, quoteCtrl.listQuotesForRFQ);

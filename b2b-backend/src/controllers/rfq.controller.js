@@ -1,6 +1,14 @@
 const prisma = require('../config/prisma');
 const asyncHandler = require('../utils/asyncHandler');
 
+// Returns { date } for a valid future deadline, { error } otherwise
+function parseDeadline(value) {
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return { error: 'deadline is not a valid date' };
+  if (date <= new Date()) return { error: 'deadline must be in the future' };
+  return { date };
+}
+
 // POST /api/rfqs  (buyer, must be verified)
 const createRFQ = asyncHandler(async (req, res) => {
   const company = await prisma.company.findUnique({ where: { id: req.user.companyId } });
@@ -10,6 +18,12 @@ const createRFQ = asyncHandler(async (req, res) => {
 
   const { title, description, category, quantity, unit, deadline, publish, budget } = req.body;
   if (!title || !description) return res.status(400).json({ error: 'title and description required' });
+  let deadlineDate = null;
+  if (deadline) {
+    const parsed = parseDeadline(deadline);
+    if (parsed.error) return res.status(400).json({ error: parsed.error });
+    deadlineDate = parsed.date;
+  }
 
   const rfq = await prisma.rFQ.create({
     data: {
@@ -20,7 +34,7 @@ const createRFQ = asyncHandler(async (req, res) => {
       quantity,
       unit,
       budget,
-      deadline: deadline ? new Date(deadline) : null,
+      deadline: deadlineDate,
       status: publish ? 'PUBLISHED' : 'DRAFT',
     },
   });
@@ -92,21 +106,33 @@ const getRFQ = asyncHandler(async (req, res) => {
   res.json(rfq);
 });
 
-// Status changes a buyer may make by hand. AWARDED is only reachable via POST /quotes/:id/award,
-// and AWARDED / CANCELLED are final.
+// Status changes a buyer may make via PATCH. AWARDED is only reachable via POST /quotes/:id/award and
+// CANCELLED only via POST /rfqs/:id/cancel (which refunds bid fees); both are final.
 const BUYER_STATUS_TRANSITIONS = {
-  DRAFT: ['PUBLISHED', 'CANCELLED'],
-  PUBLISHED: ['QUOTING_CLOSED', 'CANCELLED'],
-  QUOTING_CLOSED: ['CANCELLED'],
+  DRAFT: ['PUBLISHED'],
+  PUBLISHED: ['QUOTING_CLOSED'],
+  QUOTING_CLOSED: [],
   AWARDED: [],
   CANCELLED: [],
 };
-const CONTENT_FIELDS = ['title', 'description', 'category', 'quantity', 'unit', 'deadline'];
+const CANCELLABLE_STATUSES = ['DRAFT', 'PUBLISHED', 'QUOTING_CLOSED'];
+const CONTENT_FIELDS = ['title', 'description', 'category', 'quantity', 'unit', 'deadline', 'budget'];
 
-// PATCH /api/rfqs/:id  (buyer, owner only) - edit content, or publish/close/cancel
+// PATCH /api/rfqs/:id  (buyer, owner only) - edit content (before any quotes), or publish/close
 const updateRFQ = asyncHandler(async (req, res) => {
   const { status } = req.body;
   const contentChanged = CONTENT_FIELDS.some((f) => req.body[f] !== undefined);
+
+  let deadlineDate;
+  if (req.body.deadline !== undefined && req.body.deadline !== null) {
+    const parsed = parseDeadline(req.body.deadline);
+    if (parsed.error) return res.status(400).json({ error: parsed.error });
+    deadlineDate = parsed.date;
+  }
+  const { budget } = req.body;
+  if (budget !== undefined && budget !== null && (typeof budget !== 'number' || !Number.isFinite(budget) || budget <= 0)) {
+    return res.status(400).json({ error: 'budget must be a positive number' });
+  }
 
   const result = await prisma.$transaction(async (tx) => {
     // Lock the row so a concurrent quote submission or award can't slip between the checks and the update
@@ -135,12 +161,12 @@ const updateRFQ = asyncHandler(async (req, res) => {
       }
     }
 
-    const { title, description, category, quantity, unit, deadline } = req.body;
+    const { title, description, category, quantity, unit } = req.body;
     const rfq = await tx.rFQ.update({
       where: { id: existing.id },
       data: {
-        title, description, category, quantity, unit,
-        deadline: deadline ? new Date(deadline) : undefined,
+        title, description, category, quantity, unit, budget,
+        deadline: deadlineDate,
         status,
       },
     });
@@ -151,4 +177,63 @@ const updateRFQ = asyncHandler(async (req, res) => {
   res.json(result.rfq);
 });
 
-module.exports = { createRFQ, listRFQs, getRFQ, updateRFQ };
+// POST /api/rfqs/:id/cancel  (buyer, owner only)
+// Marks the RFQ CANCELLED (never deleted), rejects its open quotes, refunds every bid fee paid on it
+// and notifies the affected suppliers — all in one transaction.
+const cancelRFQ = asyncHandler(async (req, res) => {
+  const rfqId = req.params.id;
+
+  const result = await prisma.$transaction(async (tx) => {
+    // Same lock as submitQuote/award: no new paid quote or award can land while we refund
+    await tx.$queryRaw`SELECT id FROM "RFQ" WHERE id = ${rfqId} FOR UPDATE`;
+    const rfq = await tx.rFQ.findUnique({ where: { id: rfqId } });
+    if (!rfq) return { status: 404, error: 'RFQ not found' };
+    if (rfq.buyerCompanyId !== req.user.companyId) return { status: 403, error: 'Not your RFQ' };
+    if (!CANCELLABLE_STATUSES.includes(rfq.status)) {
+      return { status: 400, error: `Cannot cancel an RFQ in ${rfq.status} status` };
+    }
+
+    const updated = await tx.rFQ.update({ where: { id: rfqId }, data: { status: 'CANCELLED' } });
+    await tx.quote.updateMany({
+      where: { rfqId, status: { in: ['SUBMITTED', 'SHORTLISTED'] } },
+      data: { status: 'REJECTED' },
+    });
+
+    // Refund what the ledger says each supplier actually paid for this RFQ (BID_DEBIT entries are negative)
+    const quotes = await tx.quote.findMany({ where: { rfqId }, select: { supplierCompanyId: true } });
+    const supplierIds = [...new Set(quotes.map((q) => q.supplierCompanyId))];
+    const refunds = [];
+    for (const companyId of supplierIds) {
+      const wallet = await tx.wallet.findUnique({ where: { companyId }, select: { id: true } });
+      if (!wallet) continue;
+      const { _sum } = await tx.walletTransaction.aggregate({
+        where: { walletId: wallet.id, type: 'BID_DEBIT', reference: `RFQ ${rfqId}` },
+        _sum: { amount: true },
+      });
+      const refund = _sum.amount ? _sum.amount.neg() : null;
+      if (refund && refund.gt(0)) {
+        await tx.wallet.update({ where: { id: wallet.id }, data: { balance: { increment: refund } } });
+        await tx.walletTransaction.create({
+          data: { walletId: wallet.id, amount: refund, type: 'REFUND', reference: `Refund: RFQ cancelled (RFQ ${rfqId})` },
+        });
+      }
+      await tx.notification.create({
+        data: {
+          companyId,
+          type: 'RFQ_CANCELLED',
+          title: 'RFQ cancelled',
+          body: 'The buyer cancelled "' + rfq.title + '".' +
+            (refund && refund.gt(0) ? ' Your bid fee of ' + refund.toFixed(2) + ' credits has been refunded.' : ''),
+        },
+      });
+      refunds.push({ supplierCompanyId: companyId, amount: refund ? refund.toFixed(2) : '0.00' });
+    }
+
+    return { rfq: updated, refunds };
+  });
+
+  if (result.error) return res.status(result.status).json({ error: result.error });
+  res.json(result);
+});
+
+module.exports = { createRFQ, listRFQs, getRFQ, updateRFQ, cancelRFQ };

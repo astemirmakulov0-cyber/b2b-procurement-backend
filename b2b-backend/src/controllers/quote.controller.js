@@ -25,6 +25,7 @@ const submitQuote = asyncHandler(async (req, res) => {
     await tx.$queryRaw`SELECT id FROM "RFQ" WHERE id = ${rfqId} FOR UPDATE`;
     const rfq = await tx.rFQ.findUnique({ where: { id: rfqId } });
     if (!rfq || rfq.status !== 'PUBLISHED') throw fail(400, 'RFQ is not open for quotes');
+    if (rfq.deadline && rfq.deadline <= new Date()) throw fail(400, 'The deadline for this RFQ has passed');
     if (!rfq.budget) throw fail(400, 'This RFQ has no budget set — cannot calculate bid fee');
 
     const alreadyQuoted = await tx.quote.findFirst({
