@@ -1,4 +1,11 @@
 require('dotenv').config();
+const Sentry = require('@sentry/node');
+
+Sentry.init({
+  dsn: process.env.SENTRY_DSN || 'https://5f4176689d4c5e00084fefe866440e25@o4512134873153536.ingest.de.sentry.io/4512134889078864',
+  environment: process.env.NODE_ENV || 'development',
+});
+
 const express = require('express');
 const cors = require('cors');
 const helmet = require('helmet');
@@ -53,6 +60,7 @@ app.use('/api', orderRoutes);
 app.use('/api', catalogRoutes);
 
 app.use((req, res) => res.status(404).json({ error: 'Not found' }));
+Sentry.setupExpressErrorHandler(app);
 app.use(errorHandler);
 
 const PORT = process.env.PORT || 4000;
