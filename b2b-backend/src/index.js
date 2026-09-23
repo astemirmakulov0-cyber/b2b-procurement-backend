@@ -50,7 +50,15 @@ const authLimiter = rateLimit({
 });
 app.use('/api/auth/login', authLimiter);
 app.use('/api/auth/register', authLimiter);
-app.use('/api/auth/forgot-password', authLimiter);
+
+const forgotPasswordLimiter = rateLimit({
+  windowMs: 60 * 60 * 1000,
+  max: 5,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'Too many password reset requests, please try again later.' }
+});
+app.use('/api/auth/forgot-password', forgotPasswordLimiter);
 
 app.get('/api/health', (req, res) => res.json({ status: 'ok' }));
 
