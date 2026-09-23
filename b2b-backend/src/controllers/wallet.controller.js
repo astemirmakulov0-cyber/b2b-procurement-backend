@@ -10,15 +10,21 @@ const getWallet = asyncHandler(async (req, res) => {
   res.json(wallet);
 });
 
-// POST /api/wallet/topup  body: { amount, reference }
-// NOTE: in production this endpoint should be called only after a real payment gateway confirms the charge.
+// POST /api/wallet/topup  (admin)  body: { companyId, amount, reference }
+// Admin-only manual credit until a real payment gateway confirms charges.
 const topUp = asyncHandler(async (req, res) => {
-  const { amount, reference } = req.body;
-  if (!amount || amount <= 0) return res.status(400).json({ error: 'amount must be positive' });
+  const { companyId, amount, reference } = req.body;
+  if (!companyId) return res.status(400).json({ error: 'companyId required' });
+  if (typeof amount !== 'number' || !Number.isFinite(amount) || amount <= 0) {
+    return res.status(400).json({ error: 'amount must be a positive number' });
+  }
+
+  const existing = await prisma.wallet.findUnique({ where: { companyId } });
+  if (!existing) return res.status(404).json({ error: 'Wallet not found' });
 
   const result = await prisma.$transaction(async (tx) => {
     const wallet = await tx.wallet.update({
-      where: { companyId: req.user.companyId },
+      where: { companyId },
       data: { balance: { increment: amount } },
     });
     const transaction = await tx.walletTransaction.create({

@@ -9,6 +9,7 @@ router.patch('/catalog/:id', authRequired, requireRole('SUPPLIER'), catalogCtrl.
 router.delete('/catalog/:id', authRequired, requireRole('SUPPLIER'), catalogCtrl.deleteItem);
 
 router.get('/wallet', authRequired, walletCtrl.getWallet);
-router.post('/wallet/topup', authRequired, walletCtrl.topUp);
+// No payment gateway yet, so crediting a wallet is an admin-only operation
+router.post('/wallet/topup', authRequired, requireRole('ADMIN'), walletCtrl.topUp);
 
 module.exports = router;
