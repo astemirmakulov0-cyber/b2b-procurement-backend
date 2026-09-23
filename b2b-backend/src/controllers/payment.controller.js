@@ -2,8 +2,9 @@ const { Prisma } = require('@prisma/client');
 const prisma = require('../config/prisma');
 const asyncHandler = require('../utils/asyncHandler');
 const { notify } = require('../utils/notify');
+const { parseAmount, formatAmount } = require('../utils/money');
 
-const PAYMENT_METHODS = ['bank_transfer', 'cheque', 'cash', 'card', 'other'];
+const PAYMENT_METHODS = ['bank_transfer', 'benefit_pay', 'cheque', 'cash', 'card', 'other'];
 const fail = (status, message) => Object.assign(new Error(message), { status });
 
 // Sums of confirmed and pending payments and what is still open on the invoice (all Decimal)
@@ -50,13 +51,11 @@ const getInvoice = asyncHandler(async (req, res) => {
 // POST /api/invoices/:id/payments  (buyer)  body: { amount, method, reference }
 // The buyer reports a payment they made; it stays PENDING until the supplier confirms it.
 const recordPayment = asyncHandler(async (req, res) => {
-  const { amount, method } = req.body;
+  const { method } = req.body;
   const reference = typeof req.body.reference === 'string' ? req.body.reference.trim() : '';
-  if (typeof amount !== 'number' || !Number.isFinite(amount) || amount <= 0) {
-    return res.status(400).json({ error: 'amount must be a positive number' });
-  }
-  const amt = new Prisma.Decimal(amount);
-  if (amt.decimalPlaces() > 2) return res.status(400).json({ error: 'amount can have at most 2 decimal places' });
+  const parsed = parseAmount(req.body.amount);
+  if (parsed.error) return res.status(400).json({ error: parsed.error });
+  const amt = parsed.value;
   if (!PAYMENT_METHODS.includes(method)) {
     return res.status(400).json({ error: 'method must be one of ' + PAYMENT_METHODS.join(', ') });
   }
@@ -78,7 +77,7 @@ const recordPayment = asyncHandler(async (req, res) => {
       throw fail(400, 'Nothing left to pay: the rest of this invoice is awaiting the supplier\'s confirmation');
     }
     if (amt.gt(totals.outstanding)) {
-      throw fail(400, `amount exceeds the outstanding balance of ${totals.outstanding.toFixed(2)}`);
+      throw fail(400, `amount exceeds the outstanding balance of ${formatAmount(totals.outstanding)}`);
     }
 
     const payment = await tx.payment.create({
@@ -89,7 +88,7 @@ const recordPayment = asyncHandler(async (req, res) => {
 
   res.status(201).json({ payment: result.payment, totals: result.totals });
   notify(result.invoice.order.lpo.supplierCompanyId, 'PAYMENT_REPORTED', 'Payment reported',
-    'The buyer reports a payment of ' + amt.toFixed(2) + (reference ? ' (ref ' + reference + ')' : '') + '. Please confirm or reject it.',
+    'The buyer reports a payment of ' + formatAmount(amt) + (reference ? ' (ref ' + reference + ')' : '') + '. Please confirm or reject it.',
     result.invoice.orderId);
 });
 
@@ -128,7 +127,7 @@ const confirmPayment = asyncHandler(async (req, res) => {
 
   res.json(result);
   notify(payment.invoice.order.lpo.buyerCompanyId, 'PAYMENT_CONFIRMED', 'Payment confirmed',
-    'The supplier confirmed your payment of ' + payment.amount.toFixed(2) + '.', payment.invoice.orderId);
+    'The supplier confirmed your payment of ' + formatAmount(payment.amount) + '.', payment.invoice.orderId);
 });
 
 // PATCH /api/payments/:id/reject  (supplier)  body: { reason? } - money not received
@@ -149,7 +148,7 @@ const rejectPayment = asyncHandler(async (req, res) => {
 
   res.json(updated);
   notify(payment.invoice.order.lpo.buyerCompanyId, 'PAYMENT_REJECTED', 'Payment not confirmed',
-    'The supplier did not confirm your payment of ' + payment.amount.toFixed(2) + (reason ? '. Reason: ' + reason : '.'), payment.invoice.orderId);
+    'The supplier did not confirm your payment of ' + formatAmount(payment.amount) + (reason ? '. Reason: ' + reason : '.'), payment.invoice.orderId);
 });
 
 module.exports = { listInvoices, getInvoice, recordPayment, confirmPayment, rejectPayment, PAYMENT_METHODS };

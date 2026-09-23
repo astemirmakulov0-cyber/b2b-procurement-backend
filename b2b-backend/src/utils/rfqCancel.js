@@ -1,3 +1,5 @@
+const { formatAmount } = require('./money');
+
 const CANCELLABLE_STATUSES = ['DRAFT', 'PUBLISHED', 'QUOTING_CLOSED'];
 
 // Cancels an RFQ inside the caller's transaction. The caller must already hold the RFQ row lock
@@ -35,10 +37,10 @@ async function cancelRfqInTx(tx, rfq) {
         type: 'RFQ_CANCELLED',
         title: 'RFQ cancelled',
         body: 'The buyer cancelled "' + rfq.title + '".' +
-          (refund && refund.gt(0) ? ' Your bid fee of ' + refund.toFixed(2) + ' credits has been refunded.' : ''),
+          (refund && refund.gt(0) ? ' Your bid fee of ' + formatAmount(refund) + ' credits has been refunded.' : ''),
       },
     });
-    refunds.push({ supplierCompanyId: companyId, amount: refund ? refund.toFixed(2) : '0.00' });
+    refunds.push({ supplierCompanyId: companyId, amount: refund ? formatAmount(refund) : formatAmount(0) });
   }
 
   return { rfq: updated, refunds };

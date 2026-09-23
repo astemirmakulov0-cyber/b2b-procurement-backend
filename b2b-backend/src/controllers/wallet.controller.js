@@ -1,5 +1,6 @@
 const prisma = require('../config/prisma');
 const asyncHandler = require('../utils/asyncHandler');
+const { parseAmount } = require('../utils/money');
 
 // GET /api/wallet
 const getWallet = asyncHandler(async (req, res) => {
@@ -13,11 +14,11 @@ const getWallet = asyncHandler(async (req, res) => {
 // POST /api/wallet/topup  (admin)  body: { companyId, amount, reference }
 // Admin-only manual credit until a real payment gateway confirms charges.
 const topUp = asyncHandler(async (req, res) => {
-  const { companyId, amount, reference } = req.body;
+  const { companyId, reference } = req.body;
   if (!companyId) return res.status(400).json({ error: 'companyId required' });
-  if (typeof amount !== 'number' || !Number.isFinite(amount) || amount <= 0) {
-    return res.status(400).json({ error: 'amount must be a positive number' });
-  }
+  const parsed = parseAmount(req.body.amount);
+  if (parsed.error) return res.status(400).json({ error: parsed.error });
+  const amount = parsed.value;
 
   const existing = await prisma.wallet.findUnique({ where: { companyId } });
   if (!existing) return res.status(404).json({ error: 'Wallet not found' });

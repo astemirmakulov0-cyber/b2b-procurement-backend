@@ -1,6 +1,7 @@
 const prisma = require('../config/prisma');
 const asyncHandler = require('../utils/asyncHandler');
 const { CANCELLABLE_STATUSES, cancelRfqInTx } = require('../utils/rfqCancel');
+const { parseAmount } = require('../utils/money');
 
 // Returns { date } for a valid future deadline, { error } otherwise
 function parseDeadline(value) {
@@ -17,8 +18,14 @@ const createRFQ = asyncHandler(async (req, res) => {
     return res.status(403).json({ error: 'Your company must be verified before posting RFQs' });
   }
 
-  const { title, description, category, quantity, unit, deadline, publish, budget } = req.body;
+  const { title, description, category, quantity, unit, deadline, publish } = req.body;
   if (!title || !description) return res.status(400).json({ error: 'title and description required' });
+  let budget = null;
+  if (req.body.budget !== undefined && req.body.budget !== null) {
+    const parsed = parseAmount(req.body.budget, 'budget');
+    if (parsed.error) return res.status(400).json({ error: parsed.error });
+    budget = parsed.value;
+  }
   let deadlineDate = null;
   if (deadline) {
     const parsed = parseDeadline(deadline);
@@ -139,9 +146,11 @@ const updateRFQ = asyncHandler(async (req, res) => {
     if (parsed.error) return res.status(400).json({ error: parsed.error });
     deadlineDate = parsed.date;
   }
-  const { budget } = req.body;
-  if (budget !== undefined && budget !== null && (typeof budget !== 'number' || !Number.isFinite(budget) || budget <= 0)) {
-    return res.status(400).json({ error: 'budget must be a positive number' });
+  let budget;
+  if (req.body.budget !== undefined && req.body.budget !== null) {
+    const parsed = parseAmount(req.body.budget, 'budget');
+    if (parsed.error) return res.status(400).json({ error: parsed.error });
+    budget = parsed.value;
   }
 
   const result = await prisma.$transaction(async (tx) => {

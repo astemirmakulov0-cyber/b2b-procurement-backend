@@ -1,13 +1,16 @@
 const prisma = require('../config/prisma');
 const asyncHandler = require('../utils/asyncHandler');
+const { parseAmount } = require('../utils/money');
 
 // POST /api/catalog  (supplier)
 const createItem = asyncHandler(async (req, res) => {
-  const { name, description, price, unit, category, imageUrl } = req.body;
-  if (!name || price === undefined) return res.status(400).json({ error: 'name and price required' });
+  const { name, description, unit, category, imageUrl } = req.body;
+  if (!name || req.body.price === undefined) return res.status(400).json({ error: 'name and price required' });
+  const price = parseAmount(req.body.price, 'price');
+  if (price.error) return res.status(400).json({ error: price.error });
 
   const item = await prisma.catalogItem.create({
-    data: { supplierCompanyId: req.user.companyId, name, description, price, unit, category, imageUrl },
+    data: { supplierCompanyId: req.user.companyId, name, description, price: price.value, unit, category, imageUrl },
   });
   res.status(201).json(item);
 });
@@ -34,7 +37,13 @@ const updateItem = asyncHandler(async (req, res) => {
   if (!existing) return res.status(404).json({ error: 'Item not found' });
   if (existing.supplierCompanyId !== req.user.companyId) return res.status(403).json({ error: 'Forbidden' });
 
-  const { name, description, price, unit, category, isActive } = req.body;
+  const { name, description, unit, category, isActive } = req.body;
+  let price;
+  if (req.body.price !== undefined) {
+    const parsed = parseAmount(req.body.price, 'price');
+    if (parsed.error) return res.status(400).json({ error: parsed.error });
+    price = parsed.value;
+  }
   const item = await prisma.catalogItem.update({
     where: { id: req.params.id },
     data: { name, description, price, unit, category, isActive },

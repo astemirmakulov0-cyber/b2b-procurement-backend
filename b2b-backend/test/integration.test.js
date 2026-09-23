@@ -107,7 +107,7 @@ async function newRfq(budget = 500, extra = {}) {
   check('supplier cannot cancel -> 403', (await call('POST', `/rfqs/${c.id}/cancel`, S1)).status === 403);
   check('other buyer cannot cancel -> 403', (await call('POST', `/rfqs/${c.id}/cancel`, B2)).status === 403);
   r = await call('POST', `/rfqs/${c.id}/cancel`, B1);
-  check('owner cancels -> 200 with 2 refunds of 25.00', r.status === 200 && r.data.refunds.length === 2 && r.data.refunds.every((x) => x.amount === '25.00'), r.data);
+  check('owner cancels -> 200 with 2 refunds of 25.000', r.status === 200 && r.data.refunds.length === 2 && r.data.refunds.every((x) => x.amount === '25.000'), r.data);
   check('balances restored to 100/100', (await bal('sup1')) === 100 && (await bal('sup2')) === 100);
   const rfqRow = await db.rFQ.findUnique({ where: { id: c.id } });
   check('RFQ kept in DB with status CANCELLED', rfqRow && rfqRow.status === 'CANCELLED');
@@ -337,7 +337,7 @@ async function newRfq(budget = 500, extra = {}) {
   const invNow = async () => db.invoice.findUnique({ where: { id: pinv.id } });
   const poStatus = async () => (await db.order.findUnique({ where: { id: po.id } })).status;
   for (const [bad, why] of [[{ amount: -5, method: 'cash' }, 'negative'], [{ amount: 0, method: 'cash' }, 'zero'], [{ amount: '50', method: 'cash' }, 'string'],
-    [{ amount: 10.001, method: 'cash' }, '3 decimals'], [{ amount: 10, method: 'bitcoin' }, 'bad method'], [{ amount: 10, method: 'cash', reference: 'x'.repeat(101) }, 'long reference']]) {
+    [{ amount: 10.0001, method: 'cash' }, '4 decimals'], [{ amount: 10, method: 'bitcoin' }, 'bad method'], [{ amount: 10, method: 'cash', reference: 'x'.repeat(101) }, 'long reference']]) {
     check(`report payment ${why} -> 400`, (await pay(bad)).status === 400);
   }
   check('supplier cannot report a payment -> 403', (await pay({ amount: 10, method: 'cash' }, S2)).status === 403);
@@ -387,7 +387,39 @@ async function newRfq(budget = 500, extra = {}) {
   await call('PATCH', `/payments/${kp.id}/confirm`, S2, {});
   check('supplier cannot cancel order with a confirmed payment -> 400', (await call('PATCH', `/orders/${ko.id}/status`, S2, { status: 'CANCELLED' })).status === 400);
 
-  console.log('\n== 12. L7 admin delete keeps counterparties\' records ==');
+  console.log('\n== 12. BHD fils: 3 decimals everywhere ==');
+  // fee = 5% of budget rounded half-up to 3 decimals: 333.333 * 0.05 = 16.66665 -> 16.667
+  await db.wallet.update({ where: { companyId: 'sup1' }, data: { balance: 100 } });
+  const fr = await newRfq(333.333);
+  check('RFQ budget with 3 decimals stored exactly', fr && Number(fr.budget) === 333.333 && fr.budget === '333.333', fr && fr.budget);
+  check('quote with 3-decimal price -> 201', (await call('POST', `/rfqs/${fr.id}/quotes`, S1, { price: 250.125 })).status === 201);
+  const feeTx = await db.walletTransaction.findFirst({ where: { reference: `RFQ ${fr.id}`, type: 'BID_DEBIT' }, include: { wallet: true } });
+  check('bid fee 16.667 (half-up), balance 83.333, ledger matches', feeTx.amount.toString() === '-16.667' && feeTx.wallet.balance.toString() === '83.333', { fee: feeTx.amount.toString(), balance: feeTx.wallet.balance.toString() });
+  check('quote price stored exactly 250.125', (await db.quote.findFirst({ where: { rfqId: fr.id } })).price.toString() === '250.125');
+  r = await call('POST', `/rfqs/${fr.id}/cancel`, B1);
+  check('refund returns exactly 16.667', r.status === 200 && r.data.refunds[0].amount === '16.667' && (await bal('sup1')) === 100, r.data.refunds);
+  for (const [path, body, tokn, what] of [
+    ['/rfqs', { title: 'x', description: 'y', budget: 10.0005, deadline: future() }, B1, 'RFQ budget'],
+    ['/catalog', { name: 'x', price: 1.2345 }, S1, 'catalog price'],
+    ['/wallet/topup', { companyId: 'sup1', amount: 0.0001 }, ADM, 'top-up'],
+  ]) {
+    r = await call('POST', path, tokn, body);
+    check(`${what} with 4 decimals -> 400`, r.status === 400 && /3 decimal/.test(r.data.error), r.data);
+  }
+  const fq = await newRfq(100);
+  r = await call('POST', `/rfqs/${fq.id}/quotes`, S2, { price: 1.0005 });
+  check('quote price with 4 decimals -> 400, no fee charged', r.status === 400 && /3 decimal/.test(r.data.error));
+  check('admin top-up 0.005 (5 fils) -> 201', (await call('POST', '/wallet/topup', ADM, { companyId: 'sup3', amount: 0.005 })).status === 201);
+  const { invoice: finv } = await makeOrder(12.345, S2, 'sup2');
+  check('invoice amount 12.345 kept to the fils', finv.amount.toString() === '12.345');
+  r = await call('POST', `/invoices/${finv.id}/payments`, B1, { amount: 12.346, method: 'benefit_pay' });
+  check('1 fils over the outstanding -> 400 (outstanding 12.345)', r.status === 400 && /12\.345/.test(r.data.error), r.data);
+  r = await call('POST', `/invoices/${finv.id}/payments`, B1, { amount: 12.345, method: 'benefit_pay', reference: 'BP-778812' });
+  check('BenefitPay payment of 12.345 -> 201', r.status === 201 && r.data.payment.method === 'benefit_pay' && r.data.payment.amount === '12.345', r.data);
+  await call('PATCH', `/payments/${r.data.payment.id}/confirm`, S2, {});
+  check('confirmed 12.345 -> invoice PAID exactly', (await db.invoice.findUnique({ where: { id: finv.id } })).status === 'PAID');
+
+  console.log('\n== 13. L7 admin delete keeps counterparties\' records ==');
   const mkCo = async (id, role, balance = 0) => db.user.create({ data: { id: 'u-' + id, email: id + '@t.test', passwordHash: await bcrypt.hash('pw123456', 4), role, emailVerified: true,
     company: { create: { id, name: 'Co ' + id, type: role, verificationStatus: 'VERIFIED', phone: '+973 1', registrationNumber: 'CR-' + id, wallet: { create: { balance } } } } } });
   await mkCo('buyer5', 'BUYER'); await mkCo('sup5', 'SUPPLIER', 1000);
@@ -417,7 +449,7 @@ async function newRfq(budget = 500, extra = {}) {
   check('sup6 rows gone', !(await db.company.findUnique({ where: { id: 'sup6' } })) && !(await db.user.findUnique({ where: { id: 'u-sup6' } })) && (await db.catalogItem.count({ where: { name: 'sup6 item' } })) === 0);
   check('other supplier\'s quote on the same RFQ untouched', (await db.quote.count({ where: { rfqId: r6.id, supplierCompanyId: 'sup1' } })) === 1);
 
-  console.log('\n== 13. L1 errors -> 4xx ==');
+  console.log('\n== 14. L1 errors -> 4xx ==');
   r = await call('GET', '/rfqs?status=FOO', B1);
   check('invalid RFQ status filter -> 400', r.status === 400 && /status must be one of/.test(r.data.error), r.data);
   check('invalid admin status filter -> 400', (await call('GET', '/admin/companies?status=FOO', ADM)).status === 400);
@@ -430,7 +462,7 @@ async function newRfq(budget = 500, extra = {}) {
   r = await call('PATCH', '/companies/me', ADM, { name: 'x' });
   check('admin without company PATCH /companies/me -> 4xx, not 500', r.status >= 400 && r.status < 500, r);
 
-  console.log('\n== 14. transaction timeout defaults ==');
+  console.log('\n== 15. transaction timeout defaults ==');
   const appPrisma = require(path.join(root, 'src/config/prisma'));
   const t0 = Date.now();
   try {

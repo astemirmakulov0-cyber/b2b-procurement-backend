@@ -1,6 +1,7 @@
 const prisma = require('../config/prisma');
 const asyncHandler = require('../utils/asyncHandler');
 const { notify } = require('../utils/notify');
+const { MONEY_DECIMALS, parseAmount } = require('../utils/money');
 
 const BID_FEE_PERCENT = 0.05; // supplier pays 5% of the RFQ's budget to submit a quote
 
@@ -13,9 +14,8 @@ const submitQuote = asyncHandler(async (req, res) => {
 
   const { rfqId } = req.params;
   const { price, currency, deliveryTimeDays, notes } = req.body;
-  if (typeof price !== 'number' || !Number.isFinite(price) || price <= 0) {
-    return res.status(400).json({ error: 'price must be a positive number' });
-  }
+  const parsedPrice = parseAmount(price, 'price');
+  if (parsedPrice.error) return res.status(400).json({ error: parsedPrice.error });
 
   const fail = (status, message) => Object.assign(new Error(message), { status });
 
@@ -34,8 +34,8 @@ const submitQuote = asyncHandler(async (req, res) => {
     });
     if (alreadyQuoted) throw fail(409, 'You have already submitted a quote for this RFQ');
 
-    // Round to the column's 2 decimals so the debit and the ledger entry match exactly
-    const bidCost = rfq.budget.mul(BID_FEE_PERCENT).toDecimalPlaces(2);
+    // Round to the column's 3 decimals (fils) so the debit and the ledger entry match exactly
+    const bidCost = rfq.budget.mul(BID_FEE_PERCENT).toDecimalPlaces(MONEY_DECIMALS);
 
     // Conditional decrement: the balance check and the debit are one UPDATE, so two concurrent
     // bids can't both pass the check and push the balance negative.
@@ -58,7 +58,7 @@ const submitQuote = asyncHandler(async (req, res) => {
       data: {
         rfqId,
         supplierCompanyId: req.user.companyId,
-        price,
+        price: parsedPrice.value,
         currency: currency || 'BHD',
         deliveryTimeDays,
         notes,
