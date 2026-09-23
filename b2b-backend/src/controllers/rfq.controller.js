@@ -39,9 +39,18 @@ const listRFQs = asyncHandler(async (req, res) => {
   }
   if (status && req.user.role === 'BUYER') where.status = status;
 
+  const include = { _count: { select: { quotes: true } } };
+  if (req.user.role === 'SUPPLIER') {
+    // only the supplier's own quote, so the UI knows which RFQs it has already bid on
+    include.quotes = {
+      where: { supplierCompanyId: req.user.companyId },
+      select: { id: true, status: true, price: true, createdAt: true },
+    };
+  }
+
   const rfqs = await prisma.rFQ.findMany({
     where,
-    include: { _count: { select: { quotes: true } } },
+    include,
     orderBy: { createdAt: 'desc' },
   });
   res.json(rfqs);

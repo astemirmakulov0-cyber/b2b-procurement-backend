@@ -28,7 +28,7 @@ const topUp = asyncHandler(async (req, res) => {
       data: { balance: { increment: amount } },
     });
     const transaction = await tx.walletTransaction.create({
-      data: { walletId: wallet.id, amount, type: 'TOPUP', reference },
+      data: { walletId: wallet.id, amount, type: 'TOPUP', reference: reference || 'Admin credit' },
     });
     return { wallet, transaction };
   });

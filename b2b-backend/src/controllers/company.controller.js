@@ -43,7 +43,7 @@ const listCompanies = asyncHandler(async (req, res) => {
   const { status } = req.query;
   const companies = await prisma.company.findMany({
     where: status ? { verificationStatus: status } : undefined,
-    include: { documents: true, user: { select: { email: true } } },
+    include: { documents: true, user: { select: { email: true } }, wallet: { select: { balance: true } } },
     orderBy: { createdAt: 'desc' },
   });
   res.json(companies);
