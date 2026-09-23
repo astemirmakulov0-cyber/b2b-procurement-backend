@@ -41,6 +41,9 @@ const recordPayment = asyncHandler(async (req, res) => {
   if (invoice.order.lpo.buyerCompanyId !== req.user.companyId) {
     return res.status(403).json({ error: 'Only the buyer can pay this invoice' });
   }
+  if (invoice.order.status === 'CANCELLED') {
+    return res.status(400).json({ error: 'Cannot pay an invoice of a cancelled order' });
+  }
 
   const result = await prisma.$transaction(async (tx) => {
     const payment = await tx.payment.create({
@@ -58,7 +61,8 @@ const recordPayment = asyncHandler(async (req, res) => {
     });
 
     if (newStatus === 'PAID') {
-      await tx.order.update({ where: { id: invoice.orderId }, data: { status: 'COMPLETED' } });
+      // a disputed order stays DISPUTED until an admin resolves it
+      await tx.order.updateMany({ where: { id: invoice.orderId, status: { notIn: ['DISPUTED', 'CANCELLED'] } }, data: { status: 'COMPLETED' } });
     }
 
     return { payment, invoice: updatedInvoice };

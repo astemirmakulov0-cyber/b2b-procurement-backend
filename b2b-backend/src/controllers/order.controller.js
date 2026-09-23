@@ -36,40 +36,96 @@ const getOrder = asyncHandler(async (req, res) => {
   res.json(order);
 });
 
-// PATCH /api/orders/:id/status  (supplier updates lifecycle e.g. IN_PROGRESS, SHIPPED, COMPLETED)
+// Order lifecycle. COMPLETED is set by payment (invoice fully PAID), not by hand; COMPLETED and CANCELLED are final.
+const ORDER_STATUSES = ['CONFIRMED', 'IN_PROGRESS', 'SHIPPED', 'DELIVERED', 'COMPLETED', 'DISPUTED', 'CANCELLED'];
+const SUPPLIER_TRANSITIONS = {
+  CONFIRMED: ['IN_PROGRESS', 'SHIPPED', 'CANCELLED'],
+  IN_PROGRESS: ['SHIPPED', 'CANCELLED'],
+  SHIPPED: ['DELIVERED'],
+};
+// the buyer can only raise a dispute, while the order is still open
+const BUYER_TRANSITIONS = {
+  CONFIRMED: ['DISPUTED'], IN_PROGRESS: ['DISPUTED'], SHIPPED: ['DISPUTED'], DELIVERED: ['DISPUTED'],
+};
+// an admin resolves disputes
+const ADMIN_TRANSITIONS = {
+  DISPUTED: ['IN_PROGRESS', 'SHIPPED', 'DELIVERED', 'COMPLETED', 'CANCELLED'],
+};
+
+// PATCH /api/orders/:id/status  body: { status }
 const updateOrderStatus = asyncHandler(async (req, res) => {
   const { status } = req.body;
+  if (!ORDER_STATUSES.includes(status)) {
+    return res.status(400).json({ error: 'status must be one of ' + ORDER_STATUSES.join(', ') });
+  }
   const { order, isSupplier, isBuyer, error } = await loadOrderWithAccessCheck(req.params.id, req.user);
   if (error) return res.status(error.status).json({ error: error.message });
 
-  const allowed = ['IN_PROGRESS', 'SHIPPED', 'DELIVERED', 'COMPLETED', 'DISPUTED', 'CANCELLED'];
-  if (!allowed.includes(status)) return res.status(400).json({ error: 'invalid status' });
-  if (status === 'DISPUTED' && !isBuyer) return res.status(403).json({ error: 'Only buyer can raise a dispute' });
-  if (status !== 'DISPUTED' && !isSupplier) return res.status(403).json({ error: 'Only supplier can update lifecycle status' });
+  const table = req.user.role === 'ADMIN' ? ADMIN_TRANSITIONS : isSupplier ? SUPPLIER_TRANSITIONS : isBuyer ? BUYER_TRANSITIONS : {};
+  if (!(table[order.status] || []).includes(status)) {
+    return res.status(400).json({ error: `Cannot change order status from ${order.status} to ${status}` });
+  }
+  if (status === 'CANCELLED' && isSupplier) {
+    const paid = (order.invoice?.payments || []).some((p) => p.status === 'COMPLETED');
+    if (paid) return res.status(400).json({ error: 'Cannot cancel an order that has payments' });
+  }
 
-  const updated = await prisma.order.update({ where: { id: order.id }, data: { status } });
+  // Only apply if nobody changed the status since we read it
+  const { count } = await prisma.order.updateMany({ where: { id: order.id, status: order.status }, data: { status } });
+  if (count === 0) return res.status(409).json({ error: 'Order status changed meanwhile; reload and try again' });
+  const updated = await prisma.order.findUnique({ where: { id: order.id } });
   res.json(updated);
+
+  const other = isBuyer ? order.lpo.supplierCompanyId : order.lpo.buyerCompanyId;
+  notify(other, 'ORDER_STATUS', 'Order ' + status.toLowerCase().replace('_', ' '), undefined, order.id);
+  if (req.user.role === 'ADMIN') notify(order.lpo.supplierCompanyId, 'ORDER_STATUS', 'Order ' + status.toLowerCase().replace('_', ' '), undefined, order.id);
 });
 
-// PATCH /api/orders/:id/delivery  (supplier) - update delivery status / tracking
+const DELIVERY_TRANSITIONS = {
+  PENDING: ['DISPATCHED'],
+  DISPATCHED: ['IN_TRANSIT', 'DELIVERED', 'FAILED'],
+  IN_TRANSIT: ['DELIVERED', 'FAILED'],
+  FAILED: ['DISPATCHED'],
+  DELIVERED: [],
+};
+
+// PATCH /api/orders/:id/delivery  (supplier) - update delivery status and/or tracking/notes
 const updateDelivery = asyncHandler(async (req, res) => {
   const { status, trackingInfo, notes } = req.body;
+  if (status !== undefined && !Object.keys(DELIVERY_TRANSITIONS).includes(status)) {
+    return res.status(400).json({ error: 'status must be one of ' + Object.keys(DELIVERY_TRANSITIONS).join(', ') });
+  }
   const { order, isSupplier, error } = await loadOrderWithAccessCheck(req.params.id, req.user);
   if (error) return res.status(error.status).json({ error: error.message });
   if (!isSupplier) return res.status(403).json({ error: 'Only supplier can update delivery' });
-
-  const data = { status, trackingInfo, notes };
-  if (status === 'DISPATCHED') data.dispatchedAt = new Date();
-  if (status === 'DELIVERED') data.deliveredAt = new Date();
-
-  const delivery = await prisma.delivery.update({
-    where: { orderId: order.id },
-    data,
-  });
-
-  if (status === 'DELIVERED') {
-    await prisma.order.update({ where: { id: order.id }, data: { status: 'DELIVERED' } });
+  if (['CANCELLED', 'DISPUTED'].includes(order.status)) {
+    return res.status(400).json({ error: `Cannot update delivery of a ${order.status} order` });
   }
+
+  const current = order.delivery.status;
+  if (status !== undefined && status !== current && !DELIVERY_TRANSITIONS[current].includes(status)) {
+    return res.status(400).json({ error: `Cannot change delivery status from ${current} to ${status}` });
+  }
+
+  const data = { trackingInfo, notes };
+  if (status !== undefined && status !== current) {
+    data.status = status;
+    if (status === 'DISPATCHED') data.dispatchedAt = new Date();
+    if (status === 'DELIVERED') data.deliveredAt = new Date();
+  }
+
+  const delivery = await prisma.$transaction(async (tx) => {
+    const { count } = await tx.delivery.updateMany({ where: { orderId: order.id, status: current }, data });
+    if (count === 0) throw Object.assign(new Error('Delivery status changed meanwhile; reload and try again'), { status: 409 });
+    // keep the order lifecycle in step, without moving it backwards (e.g. an already COMPLETED prepaid order)
+    if (data.status === 'DISPATCHED' || data.status === 'IN_TRANSIT') {
+      await tx.order.updateMany({ where: { id: order.id, status: { in: ['CONFIRMED', 'IN_PROGRESS'] } }, data: { status: 'SHIPPED' } });
+    }
+    if (data.status === 'DELIVERED') {
+      await tx.order.updateMany({ where: { id: order.id, status: { in: ['CONFIRMED', 'IN_PROGRESS', 'SHIPPED'] } }, data: { status: 'DELIVERED' } });
+    }
+    return tx.delivery.findUnique({ where: { orderId: order.id } });
+  });
 
   res.json(delivery);
   const label = status === 'DISPATCHED' ? 'Your order has been dispatched' : status === 'DELIVERED' ? 'Your order has been delivered' : 'Delivery status updated';
