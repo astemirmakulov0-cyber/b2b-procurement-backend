@@ -13,31 +13,41 @@ const submitQuote = asyncHandler(async (req, res) => {
 
   const { rfqId } = req.params;
   const { price, currency, deliveryTimeDays, notes } = req.body;
-  if (!price) return res.status(400).json({ error: 'price required' });
+  if (typeof price !== 'number' || !Number.isFinite(price) || price <= 0) {
+    return res.status(400).json({ error: 'price must be a positive number' });
+  }
 
-  const rfq = await prisma.rFQ.findUnique({ where: { id: rfqId } });
-  if (!rfq || rfq.status !== 'PUBLISHED') {
-    return res.status(400).json({ error: 'RFQ is not open for quotes' });
-  }
-  if (!rfq.budget) {
-    return res.status(400).json({ error: 'This RFQ has no budget set — cannot calculate bid fee' });
-  }
-  const bidCost = Number(rfq.budget) * BID_FEE_PERCENT;
+  const fail = (status, message) => Object.assign(new Error(message), { status });
 
   const result = await prisma.$transaction(async (tx) => {
-    const wallet = await tx.wallet.findUnique({ where: { companyId: req.user.companyId } });
-    if (!wallet || Number(wallet.balance) < bidCost) {
-      throw Object.assign(new Error('Insufficient bid credits'), { status: 402 });
-    }
+    // Lock the RFQ row: serialises submissions on this RFQ (so the duplicate check below is reliable)
+    // and keeps it from being awarded/cancelled/edited while this quote is being charged for.
+    await tx.$queryRaw`SELECT id FROM "RFQ" WHERE id = ${rfqId} FOR UPDATE`;
+    const rfq = await tx.rFQ.findUnique({ where: { id: rfqId } });
+    if (!rfq || rfq.status !== 'PUBLISHED') throw fail(400, 'RFQ is not open for quotes');
+    if (!rfq.budget) throw fail(400, 'This RFQ has no budget set — cannot calculate bid fee');
 
-    await tx.wallet.update({
-      where: { id: wallet.id },
+    const alreadyQuoted = await tx.quote.findFirst({
+      where: { rfqId, supplierCompanyId: req.user.companyId, status: { not: 'WITHDRAWN' } },
+      select: { id: true },
+    });
+    if (alreadyQuoted) throw fail(409, 'You have already submitted a quote for this RFQ');
+
+    // Round to the column's 2 decimals so the debit and the ledger entry match exactly
+    const bidCost = rfq.budget.mul(BID_FEE_PERCENT).toDecimalPlaces(2);
+
+    // Conditional decrement: the balance check and the debit are one UPDATE, so two concurrent
+    // bids can't both pass the check and push the balance negative.
+    const { count } = await tx.wallet.updateMany({
+      where: { companyId: req.user.companyId, balance: { gte: bidCost } },
       data: { balance: { decrement: bidCost } },
     });
+    if (count === 0) throw fail(402, 'Insufficient bid credits');
+    const wallet = await tx.wallet.findUnique({ where: { companyId: req.user.companyId }, select: { id: true } });
     await tx.walletTransaction.create({
       data: {
         walletId: wallet.id,
-        amount: -bidCost,
+        amount: bidCost.neg(),
         type: 'BID_DEBIT',
         reference: `RFQ ${rfqId}`,
       },
