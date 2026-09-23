@@ -24,6 +24,20 @@ const app = express();
 // (otherwise rate limits key on rotating internal proxy IPs and never trigger).
 app.set('trust proxy', 1);
 
+// TEMP: diagnose which proxy hops Railway adds, to pick the right trust proxy setting. Remove after.
+app.use('/api/health', (req, res, next) => {
+  console.log('[ip-debug]', JSON.stringify({
+    url: req.originalUrl,
+    ip: req.ip,
+    ips: req.ips,
+    xff: req.headers['x-forwarded-for'],
+    xRealIp: req.headers['x-real-ip'],
+    envoyExternal: req.headers['x-envoy-external-address'],
+    remote: req.socket.remoteAddress,
+  }));
+  next();
+});
+
 app.use(helmet());
 app.use(cors({
   origin: [
