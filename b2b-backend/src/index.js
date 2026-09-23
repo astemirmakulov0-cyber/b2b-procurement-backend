@@ -60,6 +60,15 @@ const forgotPasswordLimiter = rateLimit({
 });
 app.use('/api/auth/forgot-password', forgotPasswordLimiter);
 
+const resendVerificationLimiter = rateLimit({
+  windowMs: 60 * 60 * 1000,
+  max: 5,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { error: 'Too many verification email requests, please try again later.' }
+});
+app.use('/api/auth/resend-verification', resendVerificationLimiter);
+
 app.get('/api/health', (req, res) => res.json({ status: 'ok' }));
 
 app.use('/api/auth', authRoutes);

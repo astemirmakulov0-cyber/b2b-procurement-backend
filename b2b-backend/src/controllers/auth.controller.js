@@ -241,4 +241,31 @@ const resetPassword = asyncHandler(async (req, res) => {
   res.json({ ok: true, message: 'Password has been reset successfully' });
 });
 
-module.exports = { register, login, me, changePassword, deleteAccount, verifyEmail, forgotPassword, resetPassword };
+// POST /api/auth/resend-verification
+// body: { email }
+const resendVerification = asyncHandler(async (req, res) => {
+  const { email } = req.body;
+  if (!email) return res.status(400).json({ error: 'email is required' });
+
+  const user = await prisma.user.findUnique({ where: { email } });
+  // Same response whether the user is missing, already verified or not, so emails can't be probed.
+  if (!user || user.emailVerified) return res.json({ ok: true });
+
+  const verificationToken = crypto.randomBytes(32).toString('hex');
+  const verificationExpires = new Date(Date.now() + 24 * 60 * 60 * 1000);
+
+  await prisma.user.update({
+    where: { id: user.id },
+    data: { verificationToken, verificationExpires },
+  });
+
+  try {
+    await sendVerificationEmail(email, verificationToken);
+  } catch (err) {
+    console.error('Failed to resend verification email:', err);
+    Sentry.captureException(err);
+  }
+  res.json({ ok: true });
+});
+
+module.exports = { register, login, me, changePassword, deleteAccount, verifyEmail, forgotPassword, resetPassword, resendVerification };
