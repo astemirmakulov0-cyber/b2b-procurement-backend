@@ -180,7 +180,9 @@ model RFQ {
   updatedAt      DateTime  @updatedAt
 
   quotes Quote[]
-  lpo    LPO?
+  // history of purchase orders: a declined LPO stays, and the RFQ can be awarded again.
+  // At most one non-declined LPO per RFQ is enforced in code under the RFQ row lock.
+  lpos   LPO[]
 }
 
 model Quote {
@@ -194,6 +196,8 @@ model Quote {
   deliveryTimeDays   Int?
   notes              String?
   status             QuoteStatus @default(SUBMITTED)
+  // set when an award auto-rejects this quote, so it can be restored if the winner declines the LPO
+  statusBeforeAward  QuoteStatus?
   createdAt          DateTime    @default(now())
   updatedAt          DateTime    @updatedAt
 
@@ -220,7 +224,7 @@ model CatalogItem {
 
 model LPO {
   id                 String    @id @default(uuid())
-  rfqId              String    @unique
+  rfqId              String
   rfq                RFQ       @relation(fields: [rfqId], references: [id])
   quoteId            String    @unique
   quote              Quote     @relation(fields: [quoteId], references: [id])
@@ -235,6 +239,8 @@ model LPO {
   updatedAt          DateTime  @updatedAt
 
   order Order?
+
+  @@index([rfqId])
 }
 
 model Order {
