@@ -9,12 +9,14 @@ const resend = new Resend(process.env.RESEND_API_KEY);
 
 async function sendVerificationEmail(email, token) {
   const verifyUrl = (process.env.FRONTEND_URL || 'http://localhost') + '/verify.html?token=' + token;
-  await resend.emails.send({
+  // Resend resolves with { error } on API failures instead of throwing.
+  const { error } = await resend.emails.send({
     from: 'Biddex <noreply@biddex.online>',
     to: email,
     subject: 'Verify your Biddex account',
     html: '<p>Welcome to Biddex. Please verify your email by clicking the link below:</p><p><a href="' + verifyUrl + '">Verify my email</a></p><p>This link expires in 24 hours.</p>'
   });
+  if (error) throw new Error('Resend error: ' + error.message);
 }
 
 async function sendPasswordResetEmail(email, token) {
@@ -79,7 +81,13 @@ const register = asyncHandler(async (req, res) => {
     include: { company: true },
   });
 
-  await sendVerificationEmail(email, verificationToken);
+  // The account is already created, so a failed send shouldn't fail the request; report it instead.
+  try {
+    await sendVerificationEmail(email, verificationToken);
+  } catch (err) {
+    console.error('Failed to send verification email:', err);
+    Sentry.captureException(err);
+  }
   res.status(201).json({
   message: 'Registration successful. Please check your email to verify your account before logging in.',
 });
