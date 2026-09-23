@@ -11,9 +11,14 @@ const awardQuote = asyncHandler(async (req, res) => {
   });
   if (!quote) return res.status(404).json({ error: 'Quote not found' });
   if (quote.rfq.buyerCompanyId !== req.user.companyId) return res.status(403).json({ error: 'Forbidden' });
-  if (quote.rfq.status === 'AWARDED') return res.status(400).json({ error: 'RFQ already awarded' });
 
   const result = await prisma.$transaction(async (tx) => {
+    // Re-check status under a row lock so a concurrent cancel/award can't race this one
+    const [rfq] = await tx.$queryRaw`SELECT status FROM "RFQ" WHERE id = ${quote.rfqId} FOR UPDATE`;
+    if (!['PUBLISHED', 'QUOTING_CLOSED'].includes(rfq.status)) {
+      throw Object.assign(new Error(`Cannot award an RFQ in ${rfq.status} status`), { status: 400 });
+    }
+
     await tx.quote.update({ where: { id: quote.id }, data: { status: 'AWARDED' } });
     await tx.quote.updateMany({
       where: { rfqId: quote.rfqId, id: { not: quote.id } },

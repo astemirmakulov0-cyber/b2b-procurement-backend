@@ -83,23 +83,63 @@ const getRFQ = asyncHandler(async (req, res) => {
   res.json(rfq);
 });
 
-// PATCH /api/rfqs/:id  (buyer, owner only) - update or publish/close
+// Status changes a buyer may make by hand. AWARDED is only reachable via POST /quotes/:id/award,
+// and AWARDED / CANCELLED are final.
+const BUYER_STATUS_TRANSITIONS = {
+  DRAFT: ['PUBLISHED', 'CANCELLED'],
+  PUBLISHED: ['QUOTING_CLOSED', 'CANCELLED'],
+  QUOTING_CLOSED: ['CANCELLED'],
+  AWARDED: [],
+  CANCELLED: [],
+};
+const CONTENT_FIELDS = ['title', 'description', 'category', 'quantity', 'unit', 'deadline'];
+
+// PATCH /api/rfqs/:id  (buyer, owner only) - edit content, or publish/close/cancel
 const updateRFQ = asyncHandler(async (req, res) => {
-  const existing = await prisma.rFQ.findUnique({ where: { id: req.params.id } });
-  if (!existing) return res.status(404).json({ error: 'RFQ not found' });
-  if (existing.buyerCompanyId !== req.user.companyId) {
-    return res.status(403).json({ error: 'Not your RFQ' });
-  }
-  const { title, description, category, quantity, unit, deadline, status } = req.body;
-  const rfq = await prisma.rFQ.update({
-    where: { id: req.params.id },
-    data: {
-      title, description, category, quantity, unit,
-      deadline: deadline ? new Date(deadline) : undefined,
-      status,
-    },
+  const { status } = req.body;
+  const contentChanged = CONTENT_FIELDS.some((f) => req.body[f] !== undefined);
+
+  const result = await prisma.$transaction(async (tx) => {
+    // Lock the row so a concurrent quote submission or award can't slip between the checks and the update
+    await tx.$queryRaw`SELECT id FROM "RFQ" WHERE id = ${req.params.id} FOR UPDATE`;
+    const existing = await tx.rFQ.findUnique({
+      where: { id: req.params.id },
+      include: { _count: { select: { quotes: true } } },
+    });
+    if (!existing) return { status: 404, error: 'RFQ not found' };
+    if (existing.buyerCompanyId !== req.user.companyId) return { status: 403, error: 'Not your RFQ' };
+
+    if (status !== undefined && status !== existing.status) {
+      const allowed = BUYER_STATUS_TRANSITIONS[existing.status] || [];
+      if (!allowed.includes(status)) {
+        return { status: 400, error: `Cannot change RFQ status from ${existing.status} to ${status}` };
+      }
+    }
+
+    // Suppliers pay to quote against the RFQ as it was published, so its content is frozen once quotes exist
+    if (contentChanged) {
+      if (!['DRAFT', 'PUBLISHED'].includes(existing.status)) {
+        return { status: 400, error: `Cannot edit an RFQ in ${existing.status} status` };
+      }
+      if (existing._count.quotes > 0) {
+        return { status: 409, error: 'Cannot edit an RFQ after quotes have been submitted' };
+      }
+    }
+
+    const { title, description, category, quantity, unit, deadline } = req.body;
+    const rfq = await tx.rFQ.update({
+      where: { id: existing.id },
+      data: {
+        title, description, category, quantity, unit,
+        deadline: deadline ? new Date(deadline) : undefined,
+        status,
+      },
+    });
+    return { rfq };
   });
-  res.json(rfq);
+
+  if (result.error) return res.status(result.status).json({ error: result.error });
+  res.json(result.rfq);
 });
 
 module.exports = { createRFQ, listRFQs, getRFQ, updateRFQ };
