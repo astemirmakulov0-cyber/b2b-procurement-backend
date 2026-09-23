@@ -16,6 +16,16 @@ async function sendVerificationEmail(email, token) {
   });
 }
 
+async function sendPasswordResetEmail(email, token) {
+  const resetUrl = (process.env.FRONTEND_URL || 'http://localhost') + '/reset-password.html?token=' + token;
+  await resend.emails.send({
+    from: 'Biddex <noreply@biddex.online>',
+    to: email,
+    subject: 'Reset your Biddex password',
+    html: '<p>We received a request to reset your Biddex password. Click the link below to choose a new one:</p><p><a href="' + resetUrl + '">Reset my password</a></p><p>This link expires in 1 hour. If you did not request a password reset, you can ignore this email.</p>'
+  });
+}
+
 function signToken(user, companyId) {
   return jwt.sign(
     { id: user.id, role: user.role, companyId: companyId || null },
@@ -167,4 +177,51 @@ const verifyEmail = asyncHandler(async (req, res) => {
   res.json({ ok: true, message: 'Email verified successfully' });
 });
 
-module.exports = { register, login, me, changePassword, deleteAccount, verifyEmail };
+// POST /api/auth/forgot-password
+// body: { email }
+const forgotPassword = asyncHandler(async (req, res) => {
+  const { email } = req.body;
+  if (!email) return res.status(400).json({ error: 'email is required' });
+
+  const user = await prisma.user.findUnique({ where: { email } });
+  // Always respond the same way so the endpoint can't be used to probe which emails exist.
+  if (!user) return res.json({ ok: true });
+
+  const resetToken = crypto.randomBytes(32).toString('hex');
+  const resetExpires = new Date(Date.now() + 60 * 60 * 1000);
+
+  await prisma.user.update({
+    where: { id: user.id },
+    data: { resetToken, resetExpires },
+  });
+
+  await sendPasswordResetEmail(email, resetToken);
+  res.json({ ok: true });
+});
+
+// POST /api/auth/reset-password
+// body: { token, newPassword }
+const resetPassword = asyncHandler(async (req, res) => {
+  const { token, newPassword } = req.body;
+  if (!token || !newPassword) {
+    return res.status(400).json({ error: 'token and newPassword are required' });
+  }
+  if (newPassword.length < 6) return res.status(400).json({ error: 'newPassword must be at least 6 characters' });
+
+  const user = await prisma.user.findUnique({ where: { resetToken: token } });
+  if (!user) return res.status(400).json({ error: 'Invalid or expired token' });
+
+  if (!user.resetExpires || user.resetExpires < new Date()) {
+    return res.status(400).json({ error: 'Token has expired' });
+  }
+
+  const passwordHash = await bcrypt.hash(newPassword, 10);
+  await prisma.user.update({
+    where: { id: user.id },
+    data: { passwordHash, resetToken: null, resetExpires: null },
+  });
+
+  res.json({ ok: true, message: 'Password has been reset successfully' });
+});
+
+module.exports = { register, login, me, changePassword, deleteAccount, verifyEmail, forgotPassword, resetPassword };

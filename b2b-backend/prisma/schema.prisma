@@ -97,6 +97,8 @@ model User {
   emailVerified  Boolean  @default(false)
   verificationToken String? @unique
   verificationExpires DateTime?
+  resetToken   String?  @unique
+  resetExpires DateTime?
   createdAt    DateTime @default(now())
   updatedAt    DateTime @updatedAt
 
