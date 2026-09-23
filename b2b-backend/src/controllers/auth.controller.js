@@ -4,6 +4,7 @@ const prisma = require('../config/prisma');
 const asyncHandler = require('../utils/asyncHandler');
 const crypto = require('crypto');
 const Sentry = require('@sentry/node');
+const { CANCELLABLE_STATUSES, cancelRfqInTx } = require('../utils/rfqCancel');
 const { Resend } = require('resend');
 const resend = new Resend(process.env.RESEND_API_KEY);
 
@@ -50,6 +51,9 @@ const register = asyncHandler(async (req, res) => {
   if (!['BUYER', 'SUPPLIER'].includes(role)) {
     return res.status(400).json({ error: 'role must be BUYER or SUPPLIER' });
   }
+  if (consent !== true) {
+    return res.status(400).json({ error: 'You must accept the Terms of Service and Privacy Policy' });
+  }
 
   const existing = await prisma.user.findUnique({ where: { email } });
   if (existing) return res.status(409).json({ error: 'Email already registered' });
@@ -73,7 +77,7 @@ const register = asyncHandler(async (req, res) => {
           country,
           phone,
           registrationNumber,
-          consentAt: consent ? new Date() : null,
+          consentAt: new Date(),
           wallet: { create: { balance: 0 } },
         },
       },
@@ -107,6 +111,11 @@ const login = asyncHandler(async (req, res) => {
 
   const valid = await bcrypt.compare(password, user.passwordHash);
   if (!valid) return res.status(401).json({ error: 'Invalid credentials' });
+
+  // checked after the password so the deactivated state isn't revealed to someone without it
+  if (!user.isActive || (user.company && !user.company.isActive)) {
+    return res.status(403).json({ error: 'This account has been deactivated' });
+  }
 
   const token = signToken(user, user.company?.id);
   res.json({
@@ -146,18 +155,38 @@ const changePassword = asyncHandler(async (req, res) => {
 });
 
 // DELETE /api/auth/me  (soft-delete: deactivate own account)
+// Existing tokens stop working immediately (authRequired checks isActive). A buyer's open RFQs are
+// cancelled with bid-fee refunds; a supplier's open quotes are withdrawn so they can't be awarded.
 const deleteAccount = asyncHandler(async (req, res) => {
   const user = await prisma.user.findUnique({ where: { id: req.user.id }, include: { company: true } });
   if (!user) return res.status(404).json({ error: 'User not found' });
 
-  if (user.company) {
-    await prisma.company.update({
-      where: { id: user.company.id },
-      data: { isActive: false },
-    });
-  }
+  let cancelledRfqs = 0;
+  await prisma.$transaction(async (tx) => {
+    await tx.user.update({ where: { id: user.id }, data: { isActive: false } });
+    if (!user.company) return;
+    const companyId = user.company.id;
+    await tx.company.update({ where: { id: companyId }, data: { isActive: false } });
 
-  res.json({ ok: true, message: 'Account deactivated successfully' });
+    const openRfqs = await tx.rFQ.findMany({
+      where: { buyerCompanyId: companyId, status: { in: CANCELLABLE_STATUSES } },
+      select: { id: true },
+    });
+    for (const { id } of openRfqs) {
+      await tx.$queryRaw`SELECT id FROM "RFQ" WHERE id = ${id} FOR UPDATE`;
+      const rfq = await tx.rFQ.findUnique({ where: { id } });
+      if (!CANCELLABLE_STATUSES.includes(rfq.status)) continue; // awarded meanwhile
+      await cancelRfqInTx(tx, rfq);
+      cancelledRfqs++;
+    }
+
+    await tx.quote.updateMany({
+      where: { supplierCompanyId: companyId, status: { in: ['SUBMITTED', 'SHORTLISTED'] } },
+      data: { status: 'WITHDRAWN' },
+    });
+  });
+
+  res.json({ ok: true, message: 'Account deactivated successfully', cancelledRfqs });
 });
  
 // GET /api/auth/verify?token=...

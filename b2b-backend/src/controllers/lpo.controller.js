@@ -18,6 +18,14 @@ const awardQuote = asyncHandler(async (req, res) => {
     if (!['PUBLISHED', 'QUOTING_CLOSED'].includes(rfq.status)) {
       throw Object.assign(new Error(`Cannot award an RFQ in ${rfq.status} status`), { status: 400 });
     }
+    // re-read under the lock: the quote may have been withdrawn (e.g. supplier deactivated its account)
+    const current = await tx.quote.findUnique({
+      where: { id: quote.id },
+      select: { status: true, supplierCompany: { select: { isActive: true } } },
+    });
+    if (!['SUBMITTED', 'SHORTLISTED'].includes(current.status) || !current.supplierCompany.isActive) {
+      throw Object.assign(new Error('This quote can no longer be awarded'), { status: 400 });
+    }
 
     await tx.quote.update({ where: { id: quote.id }, data: { status: 'AWARDED' } });
     await tx.quote.updateMany({

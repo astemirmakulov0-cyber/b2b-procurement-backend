@@ -1,5 +1,6 @@
 const prisma = require('../config/prisma');
 const asyncHandler = require('../utils/asyncHandler');
+const { CANCELLABLE_STATUSES, cancelRfqInTx } = require('../utils/rfqCancel');
 
 // Returns { date } for a valid future deadline, { error } otherwise
 function parseDeadline(value) {
@@ -53,18 +54,23 @@ const listRFQs = asyncHandler(async (req, res) => {
   }
   if (status && req.user.role === 'BUYER') where.status = status;
 
-  const include = { _count: { select: { quotes: true } } };
   if (req.user.role === 'SUPPLIER') {
-    // only the supplier's own quote, so the UI knows which RFQs it has already bid on
-    include.quotes = {
-      where: { supplierCompanyId: req.user.companyId },
-      select: { id: true, status: true, price: true, createdAt: true },
-    };
+    // don't show RFQs of deactivated buyers — nobody will ever award them
+    where.buyerCompany = { isActive: true };
+    const rfqs = await prisma.rFQ.findMany({
+      where,
+      // only the supplier's own quote, so the UI knows which RFQs it has already bid on
+      include: { quotes: { where: { supplierCompanyId: req.user.companyId }, select: { id: true, status: true, price: true, createdAt: true } } },
+      orderBy: { createdAt: 'desc' },
+    });
+    // The buyer stays anonymous until award (no buyerCompanyId, which would let suppliers group RFQs
+    // by buyer), and the number of competing quotes isn't disclosed.
+    return res.json(rfqs.map(({ buyerCompanyId, ...rfq }) => rfq));
   }
 
   const rfqs = await prisma.rFQ.findMany({
     where,
-    include,
+    include: { _count: { select: { quotes: true } } },
     orderBy: { createdAt: 'desc' },
   });
   res.json(rfqs);
@@ -93,14 +99,15 @@ const getRFQ = asyncHandler(async (req, res) => {
       return res.status(403).json({ error: 'RFQ not available' });
     }
 
-    // hide the buyer's identity until this supplier's quote has been awarded
-    const isAwarded = ownQuote && ownQuote.status === 'AWARDED';
-    if (!isAwarded) {
-      rfq.buyerCompany = { id: rfq.buyerCompany.id, name: 'Hidden until awarded' };
-    }
-
     // never expose competitors' quotes on this endpoint
     rfq.quotes = ownQuote ? [ownQuote] : [];
+
+    // hide the buyer's identity (name and id) until this supplier's quote has been awarded
+    const isAwarded = ownQuote && ownQuote.status === 'AWARDED';
+    if (!isAwarded) {
+      const { buyerCompanyId, buyerCompany, ...anonymous } = rfq;
+      return res.json({ ...anonymous, buyerCompany: { name: 'Hidden until awarded' } });
+    }
   }
 
   res.json(rfq);
@@ -115,7 +122,6 @@ const BUYER_STATUS_TRANSITIONS = {
   AWARDED: [],
   CANCELLED: [],
 };
-const CANCELLABLE_STATUSES = ['DRAFT', 'PUBLISHED', 'QUOTING_CLOSED'];
 const CONTENT_FIELDS = ['title', 'description', 'category', 'quantity', 'unit', 'deadline', 'budget'];
 
 // PATCH /api/rfqs/:id  (buyer, owner only) - edit content (before any quotes), or publish/close
@@ -193,43 +199,7 @@ const cancelRFQ = asyncHandler(async (req, res) => {
       return { status: 400, error: `Cannot cancel an RFQ in ${rfq.status} status` };
     }
 
-    const updated = await tx.rFQ.update({ where: { id: rfqId }, data: { status: 'CANCELLED' } });
-    await tx.quote.updateMany({
-      where: { rfqId, status: { in: ['SUBMITTED', 'SHORTLISTED'] } },
-      data: { status: 'REJECTED' },
-    });
-
-    // Refund what the ledger says each supplier actually paid for this RFQ (BID_DEBIT entries are negative)
-    const quotes = await tx.quote.findMany({ where: { rfqId }, select: { supplierCompanyId: true } });
-    const supplierIds = [...new Set(quotes.map((q) => q.supplierCompanyId))];
-    const refunds = [];
-    for (const companyId of supplierIds) {
-      const wallet = await tx.wallet.findUnique({ where: { companyId }, select: { id: true } });
-      if (!wallet) continue;
-      const { _sum } = await tx.walletTransaction.aggregate({
-        where: { walletId: wallet.id, type: 'BID_DEBIT', reference: `RFQ ${rfqId}` },
-        _sum: { amount: true },
-      });
-      const refund = _sum.amount ? _sum.amount.neg() : null;
-      if (refund && refund.gt(0)) {
-        await tx.wallet.update({ where: { id: wallet.id }, data: { balance: { increment: refund } } });
-        await tx.walletTransaction.create({
-          data: { walletId: wallet.id, amount: refund, type: 'REFUND', reference: `Refund: RFQ cancelled (RFQ ${rfqId})` },
-        });
-      }
-      await tx.notification.create({
-        data: {
-          companyId,
-          type: 'RFQ_CANCELLED',
-          title: 'RFQ cancelled',
-          body: 'The buyer cancelled "' + rfq.title + '".' +
-            (refund && refund.gt(0) ? ' Your bid fee of ' + refund.toFixed(2) + ' credits has been refunded.' : ''),
-        },
-      });
-      refunds.push({ supplierCompanyId: companyId, amount: refund ? refund.toFixed(2) : '0.00' });
-    }
-
-    return { rfq: updated, refunds };
+    return cancelRfqInTx(tx, rfq);
   });
 
   if (result.error) return res.status(result.status).json({ error: result.error });

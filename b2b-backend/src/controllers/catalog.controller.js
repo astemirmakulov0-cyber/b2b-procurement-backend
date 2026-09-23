@@ -18,6 +18,7 @@ const listItems = asyncHandler(async (req, res) => {
   const items = await prisma.catalogItem.findMany({
     where: {
       isActive: true,
+      supplierCompany: { isActive: true }, // hide items of deactivated suppliers
       category: category || undefined,
       supplierCompanyId: supplierCompanyId || undefined,
     },

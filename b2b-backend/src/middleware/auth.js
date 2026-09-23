@@ -1,18 +1,34 @@
 const jwt = require('jsonwebtoken');
+const prisma = require('../config/prisma');
 
-function authRequired(req, res, next) {
+async function authRequired(req, res, next) {
   const header = req.headers.authorization;
   if (!header || !header.startsWith('Bearer ')) {
     return res.status(401).json({ error: 'Missing or invalid Authorization header' });
   }
   const token = header.split(' ')[1];
+  let payload;
   try {
-    const payload = jwt.verify(token, process.env.JWT_SECRET);
-    req.user = payload; // { id, role, companyId }
-    next();
+    payload = jwt.verify(token, process.env.JWT_SECRET);
   } catch (err) {
     return res.status(401).json({ error: 'Invalid or expired token' });
   }
+
+  try {
+    // JWTs live for days, so check on every request that the account hasn't been deactivated since
+    const user = await prisma.user.findUnique({
+      where: { id: payload.id },
+      select: { isActive: true, company: { select: { isActive: true } } },
+    });
+    if (!user || !user.isActive || (user.company && !user.company.isActive)) {
+      return res.status(401).json({ error: 'Account deactivated' });
+    }
+  } catch (err) {
+    return next(err);
+  }
+
+  req.user = payload; // { id, role, companyId }
+  next();
 }
 
 function requireRole(...roles) {
