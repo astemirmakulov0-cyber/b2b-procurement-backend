@@ -99,6 +99,8 @@ model User {
   verificationExpires DateTime?
   resetToken   String?  @unique
   resetExpires DateTime?
+  // bumped on every password change/reset; JWTs carry it as `tv` and older ones are rejected
+  tokenVersion Int      @default(0)
   createdAt    DateTime @default(now())
   updatedAt    DateTime @updatedAt
 

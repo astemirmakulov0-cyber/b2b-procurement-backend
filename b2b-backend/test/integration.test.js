@@ -34,8 +34,8 @@ const BASE = `http://127.0.0.1:${process.env.TEST_APP_PORT}/api`;
 let pass = 0, fail = 0;
 const check = (name, cond, extra) => { cond ? pass++ : fail++; console.log((cond ? 'PASS ' : 'FAIL ') + name + (extra !== undefined ? '  ' + JSON.stringify(extra) : '')); };
 const tok = (role, companyId) => jwt.sign({ id: 'u-' + (companyId || role), role, companyId }, process.env.JWT_SECRET);
-async function call(method, p, token, body, raw) {
-  const headers = { 'Content-Type': 'application/json' };
+async function call(method, p, token, body, raw, extraHeaders) {
+  const headers = { 'Content-Type': 'application/json', ...(extraHeaders || {}) };
   if (token) headers.Authorization = 'Bearer ' + token;
   const r = await fetch(BASE + p, { method, headers, body: raw !== undefined ? raw : body ? JSON.stringify(body) : undefined });
   let data = null; try { data = await r.json(); } catch (e) {}
@@ -449,7 +449,72 @@ async function newRfq(budget = 500, extra = {}) {
   check('sup6 rows gone', !(await db.company.findUnique({ where: { id: 'sup6' } })) && !(await db.user.findUnique({ where: { id: 'u-sup6' } })) && (await db.catalogItem.count({ where: { name: 'sup6 item' } })) === 0);
   check('other supplier\'s quote on the same RFQ untouched', (await db.quote.count({ where: { rfqId: r6.id, supplierCompanyId: 'sup1' } })) === 1);
 
-  console.log('\n== 14. L1 errors -> 4xx ==');
+  console.log('\n== 14. accounts: M2 token invalidation, M18 email/password, M3 re-verification ==');
+  await mkCo('sup7', 'SUPPLIER', 100);
+  const login7 = async (password = 'pw123456', email = 'sup7@t.test') => call('POST', '/auth/login', null, { email, password });
+  r = await login7();
+  const T1 = r.data.token;
+  check('login -> token; token works', r.status === 200 && (await call('GET', '/rfqs', T1)).status === 200);
+  r = await call('PATCH', '/auth/password', T1, { currentPassword: 'wrong-pass', newPassword: 'newpass123' });
+  check('wrong current password -> 401, session kept', r.status === 401 && (await call('GET', '/rfqs', T1)).status === 200);
+  check('new password of 7 chars -> 400', (await call('PATCH', '/auth/password', T1, { currentPassword: 'pw123456', newPassword: 'short77' })).status === 400);
+  r = await call('PATCH', '/auth/password', T1, { currentPassword: 'pw123456', newPassword: 'newpass123' });
+  const T2 = r.data && r.data.token;
+  check('change password -> 200 with a fresh token', r.status === 200 && !!T2 && T2 !== T1, r.data);
+  r = await call('GET', '/rfqs', T1);
+  check('old token rejected after password change', r.status === 401 && r.data.error === 'Invalid or expired token', r.data);
+  check('fresh token works', (await call('GET', '/rfqs', T2)).status === 200);
+  check('old password no longer logs in', (await login7('pw123456')).status === 401);
+
+  check('forgot-password with different case/spaces -> 200', (await call('POST', '/auth/forgot-password', null, { email: '  SUP7@T.Test ' })).status === 200);
+  const rt = (await db.user.findUnique({ where: { id: 'u-sup7' } })).resetToken;
+  check('reset token issued for the normalized email', !!rt);
+  check('reset with 7-char password -> 400', (await call('POST', '/auth/reset-password', null, { token: rt, newPassword: 'short77' })).status === 400);
+  check('reset password -> 200', (await call('POST', '/auth/reset-password', null, { token: rt, newPassword: 'resetpass9' })).status === 200);
+  check('token from before the reset rejected', (await call('GET', '/rfqs', T2)).status === 401);
+  r = await login7('resetpass9', 'Sup7@T.TEST');
+  const T3 = r.data && r.data.token;
+  check('login with new password and mixed-case email -> 200', r.status === 200);
+  const tr = await call('POST', '/admin/companies/sup7/reset-password', ADM);
+  check('admin reset-password -> temp password', tr.status === 200 && !!tr.data.tempPassword);
+  check('token from before the admin reset rejected', (await call('GET', '/rfqs', T3)).status === 401);
+  check('temp password logs in', (await login7(tr.data.tempPassword)).status === 200);
+
+  // no Railway proxy in tests: give this section its own client IP so /register's 10-per-15-min limit
+  // (already partly used by the consent tests) doesn't interfere; trust proxy 2 reads it from XFF
+  const REG_FROM = { 'X-Forwarded-For': '203.0.113.7, 10.0.0.1' };
+  const regBody = (email, password = 'goodpass1') => ({ email, password, role: 'BUYER', companyName: 'Reg', consent: true });
+  r = await call('POST', '/auth/register', null, regBody('  Mixed.Case@Example.COM '), undefined, REG_FROM);
+  check('register with mixed case -> 201', r.status === 201, r.data);
+  check('stored lowercase and trimmed', !!(await db.user.findUnique({ where: { email: 'mixed.case@example.com' } })));
+  r = await call('POST', '/auth/register', null, regBody('MIXED.case@example.com'), undefined, REG_FROM);
+  check('same email in other case -> 409', r.status === 409, r.data);
+  for (const [email, pw, why] of [['not-an-email', 'goodpass1', 'invalid email'], ['a@b', 'goodpass1', 'email without domain dot'],
+    ['ok@example.com', 'seven77', '7-char password'], ['ok@example.com', 'x'.repeat(73), '73-byte password'], ['ok@example.com', 'пароль'.repeat(7), 'long multibyte password']]) {
+    r = await call('POST', '/auth/register', null, regBody(email, pw), undefined, REG_FROM);
+    check(`register ${why} -> 400`, r.status === 400, r.data);
+  }
+
+  const coStatus = async (id) => (await db.company.findUnique({ where: { id } })).verificationStatus;
+  await mkCo('sup8', 'SUPPLIER', 100);
+  const S8 = tok('SUPPLIER', 'sup8');
+  r = await call('PATCH', '/companies/me', S8, { phone: '+973 2' });
+  check('verified: phone change keeps VERIFIED', r.status === 200 && r.data.reverificationRequired === false && (await coStatus('sup8')) === 'VERIFIED');
+  r = await call('PATCH', '/companies/me', S8, { name: 'Co sup8', registrationNumber: ' CR-sup8 ' });
+  check('verified: same name/CR (incl. spaces) keeps VERIFIED', r.status === 200 && (await coStatus('sup8')) === 'VERIFIED', r.data);
+  check('empty name -> 400', (await call('PATCH', '/companies/me', S8, { name: '  ' })).status === 400);
+  r = await call('PATCH', '/companies/me', S8, { name: 'Renamed Trading WLL' });
+  check('verified: name change -> IN_REVIEW, flagged', r.status === 200 && r.data.reverificationRequired === true && (await coStatus('sup8')) === 'IN_REVIEW' && /Re-verification/.test(r.data.verificationNotes), r.data);
+  const rv = await newRfq(100);
+  check('while IN_REVIEW the supplier cannot quote', (await call('POST', `/rfqs/${rv.id}/quotes`, S8, { price: 10 })).status === 403);
+  check('admin re-verifies', (await call('PATCH', '/admin/companies/sup8/verify', ADM, { status: 'VERIFIED' })).status === 200);
+  r = await call('PATCH', '/companies/me', S8, { registrationNumber: 'CR-NEW-1' });
+  check('verified: CR change -> IN_REVIEW', r.data.reverificationRequired === true && (await coStatus('sup8')) === 'IN_REVIEW');
+  await db.company.update({ where: { id: 'sup8' }, data: { verificationStatus: 'PENDING' } });
+  r = await call('PATCH', '/companies/me', S8, { name: 'Another Name' });
+  check('not verified: name change keeps PENDING', r.data.reverificationRequired === false && (await coStatus('sup8')) === 'PENDING');
+
+  console.log('\n== 15. L1 errors -> 4xx ==');
   r = await call('GET', '/rfqs?status=FOO', B1);
   check('invalid RFQ status filter -> 400', r.status === 400 && /status must be one of/.test(r.data.error), r.data);
   check('invalid admin status filter -> 400', (await call('GET', '/admin/companies?status=FOO', ADM)).status === 400);
@@ -462,7 +527,7 @@ async function newRfq(budget = 500, extra = {}) {
   r = await call('PATCH', '/companies/me', ADM, { name: 'x' });
   check('admin without company PATCH /companies/me -> 4xx, not 500', r.status >= 400 && r.status < 500, r);
 
-  console.log('\n== 15. transaction timeout defaults ==');
+  console.log('\n== 16. transaction timeout defaults ==');
   const appPrisma = require(path.join(root, 'src/config/prisma'));
   const t0 = Date.now();
   try {

@@ -5,6 +5,7 @@ const asyncHandler = require('../utils/asyncHandler');
 const crypto = require('crypto');
 const Sentry = require('@sentry/node');
 const { CANCELLABLE_STATUSES, cancelRfqInTx } = require('../utils/rfqCancel');
+const { normalizeEmail, emailError, passwordError } = require('../utils/credentials');
 const { Resend } = require('resend');
 const resend = new Resend(process.env.RESEND_API_KEY);
 
@@ -32,9 +33,10 @@ async function sendPasswordResetEmail(email, token) {
   if (error) throw new Error('Resend error: ' + error.message);
 }
 
+// tv = the user's tokenVersion at signing time; authRequired rejects the token once it has been bumped
 function signToken(user, companyId) {
   return jwt.sign(
-    { id: user.id, role: user.role, companyId: companyId || null },
+    { id: user.id, role: user.role, companyId: companyId || null, tv: user.tokenVersion || 0 },
     process.env.JWT_SECRET,
     { expiresIn: process.env.JWT_EXPIRES_IN || '7d' }
   );
@@ -43,11 +45,14 @@ function signToken(user, companyId) {
 // POST /api/auth/register
 // body: { email, password, role: 'BUYER'|'SUPPLIER', companyName, country }
 const register = asyncHandler(async (req, res) => {
-  const { email, password, role, companyName, country, phone, registrationNumber, consent } = req.body;
+  const { password, role, companyName, country, phone, registrationNumber, consent } = req.body;
+  const email = normalizeEmail(req.body.email);
 
   if (!email || !password || !role || !companyName) {
     return res.status(400).json({ error: 'email, password, role and companyName are required' });
   }
+  const invalid = emailError(email) || passwordError(password);
+  if (invalid) return res.status(400).json({ error: invalid });
   if (!['BUYER', 'SUPPLIER'].includes(role)) {
     return res.status(400).json({ error: 'role must be BUYER or SUPPLIER' });
   }
@@ -99,7 +104,8 @@ const register = asyncHandler(async (req, res) => {
 
 // POST /api/auth/login
 const login = asyncHandler(async (req, res) => {
-  const { email, password } = req.body;
+  const { password } = req.body;
+  const email = normalizeEmail(req.body.email);
   if (!email || !password) return res.status(400).json({ error: 'email and password required' });
 
   const user = await prisma.user.findUnique({ where: { email }, include: { company: true } });
@@ -141,7 +147,8 @@ const changePassword = asyncHandler(async (req, res) => {
   if (!currentPassword || !newPassword) {
     return res.status(400).json({ error: 'currentPassword and newPassword are required' });
   }
-  if (newPassword.length < 6) return res.status(400).json({ error: 'newPassword must be at least 6 characters' });
+  const invalid = passwordError(newPassword, 'newPassword');
+  if (invalid) return res.status(400).json({ error: invalid });
 
   const user = await prisma.user.findUnique({ where: { id: req.user.id } });
   if (!user) return res.status(404).json({ error: 'User not found' });
@@ -149,9 +156,13 @@ const changePassword = asyncHandler(async (req, res) => {
   const valid = await bcrypt.compare(currentPassword, user.passwordHash);
   if (!valid) return res.status(401).json({ error: 'Current password is incorrect' });
 
+  // bumping tokenVersion logs out every other session; this one gets a fresh token
   const passwordHash = await bcrypt.hash(newPassword, 10);
-  await prisma.user.update({ where: { id: user.id }, data: { passwordHash } });
-  res.json({ ok: true });
+  const updated = await prisma.user.update({
+    where: { id: user.id },
+    data: { passwordHash, tokenVersion: { increment: 1 }, resetToken: null, resetExpires: null },
+  });
+  res.json({ ok: true, token: signToken(updated, req.user.companyId) });
 });
 
 // DELETE /api/auth/me  (soft-delete: deactivate own account)
@@ -220,7 +231,7 @@ const verifyEmail = asyncHandler(async (req, res) => {
 // POST /api/auth/forgot-password
 // body: { email }
 const forgotPassword = asyncHandler(async (req, res) => {
-  const { email } = req.body;
+  const email = normalizeEmail(req.body.email);
   if (!email) return res.status(400).json({ error: 'email is required' });
 
   const user = await prisma.user.findUnique({ where: { email } });
@@ -237,7 +248,7 @@ const forgotPassword = asyncHandler(async (req, res) => {
 
   // A failed send must not change the response, otherwise it reveals that the email exists.
   try {
-    await sendPasswordResetEmail(email, resetToken);
+    await sendPasswordResetEmail(user.email, resetToken);
   } catch (err) {
     console.error('Failed to send password reset email:', err);
     Sentry.captureException(err);
@@ -252,7 +263,8 @@ const resetPassword = asyncHandler(async (req, res) => {
   if (!token || !newPassword) {
     return res.status(400).json({ error: 'token and newPassword are required' });
   }
-  if (newPassword.length < 6) return res.status(400).json({ error: 'newPassword must be at least 6 characters' });
+  const invalid = passwordError(newPassword, 'newPassword');
+  if (invalid) return res.status(400).json({ error: invalid });
 
   const user = await prisma.user.findUnique({ where: { resetToken: token } });
   if (!user) return res.status(400).json({ error: 'Invalid or expired token' });
@@ -261,10 +273,11 @@ const resetPassword = asyncHandler(async (req, res) => {
     return res.status(400).json({ error: 'Token has expired' });
   }
 
+  // tokenVersion bump: whoever held the old password (or a stolen token) is logged out everywhere
   const passwordHash = await bcrypt.hash(newPassword, 10);
   await prisma.user.update({
     where: { id: user.id },
-    data: { passwordHash, resetToken: null, resetExpires: null },
+    data: { passwordHash, resetToken: null, resetExpires: null, tokenVersion: { increment: 1 } },
   });
 
   res.json({ ok: true, message: 'Password has been reset successfully' });
@@ -273,7 +286,7 @@ const resetPassword = asyncHandler(async (req, res) => {
 // POST /api/auth/resend-verification
 // body: { email }
 const resendVerification = asyncHandler(async (req, res) => {
-  const { email } = req.body;
+  const email = normalizeEmail(req.body.email);
   if (!email) return res.status(400).json({ error: 'email is required' });
 
   const user = await prisma.user.findUnique({ where: { email } });
@@ -289,7 +302,7 @@ const resendVerification = asyncHandler(async (req, res) => {
   });
 
   try {
-    await sendVerificationEmail(email, verificationToken);
+    await sendVerificationEmail(user.email, verificationToken);
   } catch (err) {
     console.error('Failed to resend verification email:', err);
     Sentry.captureException(err);

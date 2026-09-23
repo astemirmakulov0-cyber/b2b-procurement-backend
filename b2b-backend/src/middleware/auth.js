@@ -16,12 +16,16 @@ async function authRequired(req, res, next) {
 
   try {
     // JWTs live for days, so check on every request that the account hasn't been deactivated since
+    // and that the password hasn't been changed/reset since the token was issued
     const user = await prisma.user.findUnique({
       where: { id: payload.id },
-      select: { isActive: true, company: { select: { isActive: true } } },
+      select: { isActive: true, tokenVersion: true, company: { select: { isActive: true } } },
     });
     if (!user || !user.isActive || (user.company && !user.company.isActive)) {
       return res.status(401).json({ error: 'Account deactivated' });
+    }
+    if ((payload.tv || 0) !== user.tokenVersion) {
+      return res.status(401).json({ error: 'Invalid or expired token' });
     }
   } catch (err) {
     return next(err);

@@ -15,13 +15,32 @@ const getMyCompany = asyncHandler(async (req, res) => {
 });
 
 // PATCH /api/companies/me
+// Name and CR number are what an admin verified: changing either on a VERIFIED company sends it back to
+// IN_REVIEW, so it can't post RFQs or quote until an admin re-verifies it.
 const updateMyCompany = asyncHandler(async (req, res) => {
-  const { name, country, address, phone, registrationNumber } = req.body;
+  const { country, address, phone } = req.body;
+  const trim = (v) => (typeof v === 'string' ? v.trim() : v);
+  const name = trim(req.body.name);
+  const registrationNumber = trim(req.body.registrationNumber);
+  if (name !== undefined && !name) return res.status(400).json({ error: 'name cannot be empty' });
+
+  const current = await prisma.company.findUnique({ where: { id: req.user.companyId } });
+  if (!current) return res.status(404).json({ error: 'Company not found' });
+
+  const identityChanged =
+    (name !== undefined && name !== current.name) ||
+    (registrationNumber !== undefined && (registrationNumber || null) !== (current.registrationNumber || null));
+  const reverify = identityChanged && current.verificationStatus === 'VERIFIED';
+
   const company = await prisma.company.update({
-    where: { id: req.user.companyId },
-    data: { name, country, address, phone, registrationNumber },
+    where: { id: current.id },
+    data: {
+      name, country, address, phone,
+      registrationNumber: registrationNumber === undefined ? undefined : (registrationNumber || null),
+      ...(reverify ? { verificationStatus: 'IN_REVIEW', verificationNotes: 'Re-verification required: company name or CR number changed' } : {}),
+    },
   });
-  res.json(company);
+  res.json({ ...company, reverificationRequired: reverify });
 });
 
 // POST /api/companies/me/documents
@@ -79,7 +98,8 @@ const resetCompanyPassword = asyncHandler(async (req, res) => {
 
   const tempPassword = crypto.randomBytes(6).toString('base64url'); // ~8 char random password
   const passwordHash = await bcrypt.hash(tempPassword, 10);
-  await prisma.user.update({ where: { id: company.userId }, data: { passwordHash } });
+  // also ends all of the user's existing sessions
+  await prisma.user.update({ where: { id: company.userId }, data: { passwordHash, tokenVersion: { increment: 1 } } });
 
   res.json({ ok: true, tempPassword });
 });
