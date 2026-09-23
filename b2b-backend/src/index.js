@@ -17,6 +17,7 @@ const rfqRoutes = require('./routes/rfq.routes');
 const orderRoutes = require('./routes/order.routes');
 const catalogRoutes = require('./routes/catalog.routes');
 const errorHandler = require('./middleware/errorHandler');
+const prismaErrors = require('./middleware/prismaErrors');
 const rateLimit = require('express-rate-limit');
 
 const app = express();
@@ -103,6 +104,7 @@ app.use('/api', orderRoutes);
 app.use('/api', catalogRoutes);
 
 app.use((req, res) => res.status(404).json({ error: 'Not found' }));
+app.use(prismaErrors); // before Sentry, so request-caused DB errors arrive as 4xx and aren't reported
 Sentry.setupExpressErrorHandler(app);
 app.use(errorHandler);
 

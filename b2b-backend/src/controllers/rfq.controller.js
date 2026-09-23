@@ -45,6 +45,10 @@ const createRFQ = asyncHandler(async (req, res) => {
 // GET /api/rfqs  - buyers see their own; suppliers see published RFQs (with optional category filter for matching)
 const listRFQs = asyncHandler(async (req, res) => {
   const { category, status } = req.query;
+  const RFQ_STATUSES = ['DRAFT', 'PUBLISHED', 'QUOTING_CLOSED', 'AWARDED', 'CANCELLED'];
+  if (status !== undefined && !RFQ_STATUSES.includes(status)) {
+    return res.status(400).json({ error: 'status must be one of ' + RFQ_STATUSES.join(', ') });
+  }
   let where = {};
   if (req.user.role === 'BUYER') {
     where.buyerCompanyId = req.user.companyId;

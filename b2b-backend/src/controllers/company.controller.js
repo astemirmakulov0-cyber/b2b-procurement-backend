@@ -41,6 +41,10 @@ const addDocument = asyncHandler(async (req, res) => {
 // GET /api/admin/companies?status=PENDING
 const listCompanies = asyncHandler(async (req, res) => {
   const { status } = req.query;
+  const STATUSES = ['PENDING', 'IN_REVIEW', 'VERIFIED', 'REJECTED'];
+  if (status !== undefined && !STATUSES.includes(status)) {
+    return res.status(400).json({ error: 'status must be one of ' + STATUSES.join(', ') });
+  }
   const companies = await prisma.company.findMany({
     where: status ? { verificationStatus: status } : undefined,
     include: { documents: true, user: { select: { email: true } }, wallet: { select: { balance: true } } },
