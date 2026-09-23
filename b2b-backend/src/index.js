@@ -35,7 +35,17 @@ app.use(cors({
   credentials: true
 }));
 app.use(morgan('dev'));
-app.use(express.json({ limit: '10mb' }));
+// Parse JSON globally, but don't reject malformed bodies here: that would answer 400 before
+// authRequired/requireRole run. asyncHandler rejects them once the request reaches a controller.
+const jsonParser = express.json({ limit: '10mb' });
+app.use((req, res, next) => jsonParser(req, res, (err) => {
+  if (err && err.type === 'entity.parse.failed') {
+    req.body = {};
+    req.bodyParseError = err;
+    return next();
+  }
+  next(err);
+}));
 const apiLimiter = rateLimit({
   windowMs: 15 * 60 * 1000,
   max: 1000,
