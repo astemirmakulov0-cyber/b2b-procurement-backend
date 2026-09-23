@@ -8,7 +8,8 @@
     "start": "node src/index.js",
     "prisma:generate": "prisma generate",
     "prisma:migrate": "prisma migrate dev",
-    "prisma:studio": "prisma studio"
+    "prisma:studio": "prisma studio",
+    "test": "node test/run.js"
   },
   "dependencies": {
     "@prisma/client": "^5.19.0",
@@ -25,6 +26,7 @@
     "zod": "^3.23.8"
   },
   "devDependencies": {
+    "embedded-postgres": "17.5.0-beta.15",
     "nodemon": "^3.1.4",
     "prisma": "^5.19.0"
   }
