@@ -3,6 +3,7 @@ const jwt = require('jsonwebtoken');
 const prisma = require('../config/prisma');
 const asyncHandler = require('../utils/asyncHandler');
 const crypto = require('crypto');
+const Sentry = require('@sentry/node');
 const { Resend } = require('resend');
 const resend = new Resend(process.env.RESEND_API_KEY);
 
@@ -18,12 +19,14 @@ async function sendVerificationEmail(email, token) {
 
 async function sendPasswordResetEmail(email, token) {
   const resetUrl = (process.env.FRONTEND_URL || 'http://localhost') + '/reset-password.html?token=' + token;
-  await resend.emails.send({
+  // Resend resolves with { error } on API failures instead of throwing.
+  const { error } = await resend.emails.send({
     from: 'Biddex <noreply@biddex.online>',
     to: email,
     subject: 'Reset your Biddex password',
     html: '<p>We received a request to reset your Biddex password. Click the link below to choose a new one:</p><p><a href="' + resetUrl + '">Reset my password</a></p><p>This link expires in 1 hour. If you did not request a password reset, you can ignore this email.</p>'
   });
+  if (error) throw new Error('Resend error: ' + error.message);
 }
 
 function signToken(user, companyId) {
@@ -195,7 +198,13 @@ const forgotPassword = asyncHandler(async (req, res) => {
     data: { resetToken, resetExpires },
   });
 
-  await sendPasswordResetEmail(email, resetToken);
+  // A failed send must not change the response, otherwise it reveals that the email exists.
+  try {
+    await sendPasswordResetEmail(email, resetToken);
+  } catch (err) {
+    console.error('Failed to send password reset email:', err);
+    Sentry.captureException(err);
+  }
   res.json({ ok: true });
 });
 
