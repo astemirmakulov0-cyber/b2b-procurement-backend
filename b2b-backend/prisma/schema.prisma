@@ -198,6 +198,9 @@ model Quote {
   updatedAt          DateTime    @updatedAt
 
   lpo LPO?
+
+  // one quote per supplier per RFQ (also enforced in submitQuote; this is the DB-level guarantee)
+  @@unique([rfqId, supplierCompanyId])
 }
 
 model CatalogItem {
