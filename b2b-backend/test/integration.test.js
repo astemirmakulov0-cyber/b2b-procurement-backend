@@ -268,6 +268,26 @@ async function newRfq(budget = 500, extra = {}) {
   check('accept vs decline race: one 200, consistent end state', race.filter((x) => x.status === 200).length === 1 &&
     ((final3.status === 'ACCEPTED' && final3.order) || (final3.status === 'DECLINED' && !final3.order)), { codes: race.map((x) => x.status), status: final3.status });
 
+  // two different quotes of the same RFQ awarded at the same moment: exactly one may win
+  for (let round = 1; round <= 3; round++) {
+    await db.wallet.updateMany({ where: { companyId: { in: ['sup1', 'sup2'] } }, data: { balance: 100 } });
+    const pa = await newRfq(100);
+    await call('POST', `/rfqs/${pa.id}/quotes`, S1, { price: 50 });
+    await call('POST', `/rfqs/${pa.id}/quotes`, S2, { price: 60 });
+    const [qa, qb] = await db.quote.findMany({ where: { rfqId: pa.id }, orderBy: { supplierCompanyId: 'asc' } });
+    const both = await Promise.all([call('POST', `/quotes/${qa.id}/award`, B1, {}), call('POST', `/quotes/${qb.id}/award`, B1, {})]);
+    const lpos = await db.lPO.findMany({ where: { rfqId: pa.id } });
+    const quotesAfter = await db.quote.findMany({ where: { rfqId: pa.id } });
+    const codes = both.map((x) => x.status).sort();
+    check(`parallel award of two quotes (round ${round}): one 201 + one 400, 1 LPO, 1 AWARDED quote, RFQ AWARDED`,
+      codes.join() === '201,400' && lpos.length === 1 &&
+      quotesAfter.filter((q) => q.status === 'AWARDED').length === 1 &&
+      quotesAfter.filter((q) => q.status === 'REJECTED').length === 1 &&
+      lpos[0].quoteId === quotesAfter.find((q) => q.status === 'AWARDED').id &&
+      (await db.rFQ.findUnique({ where: { id: pa.id } })).status === 'AWARDED',
+      { codes, lpos: lpos.length, quotes: quotesAfter.map((q) => q.status) });
+  }
+
   console.log('\n== 10. M6 order state machine ==');
   const st = (tokn, status) => call('PATCH', `/orders/${order1.id}/status`, tokn, { status });
   const ordStatus = async () => (await db.order.findUnique({ where: { id: order1.id } })).status;
