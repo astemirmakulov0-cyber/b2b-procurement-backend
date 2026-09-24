@@ -1,10 +1,24 @@
 require('dotenv').config();
 const Sentry = require('@sentry/node');
 
+// Error reporting is configured only via SENTRY_DSN; without it Sentry stays off (e.g. local dev, tests)
+if (!process.env.SENTRY_DSN) console.warn('SENTRY_DSN is not set: error reporting to Sentry is disabled.');
 Sentry.init({
-  dsn: process.env.SENTRY_DSN || 'https://5f4176689d4c5e00084fefe866440e25@o4512134873153536.ingest.de.sentry.io/4512134889078864',
+  dsn: process.env.SENTRY_DSN || undefined,
   environment: process.env.NODE_ENV || 'development',
 });
+
+// Without JWT_SECRET every login would fail with a 500, so refuse to start. A weak secret is logged
+// loudly instead of crashing, so a deploy can't take production down over it.
+const EXAMPLE_JWT_SECRET = 'change_this_to_a_long_random_secret';
+if (!process.env.JWT_SECRET) {
+  console.error('FATAL: JWT_SECRET is not set. Refusing to start.');
+  process.exit(1);
+}
+if (process.env.JWT_SECRET.length < 32 || process.env.JWT_SECRET === EXAMPLE_JWT_SECRET) {
+  console.error('WARNING: JWT_SECRET is weak (shorter than 32 characters or the .env.example value). Replace it with a long random secret.');
+  Sentry.captureMessage('JWT_SECRET is weak', 'warning');
+}
 
 const express = require('express');
 const cors = require('cors');

@@ -34,6 +34,13 @@ async function sendPasswordResetEmail(email, token) {
   if (error) throw new Error('Resend error: ' + error.message);
 }
 
+// Compared against when the email isn't registered, so a failed login takes the same bcrypt time either way
+const DUMMY_PASSWORD_HASH = bcrypt.hashSync(crypto.randomBytes(16).toString('hex'), 10);
+
+// Reset tokens are stored as SHA-256 hashes: someone who can read the database can't use them. The raw
+// token only exists in the email link. (High-entropy random tokens, so a plain fast hash is enough.)
+const hashToken = (token) => crypto.createHash('sha256').update(String(token)).digest('hex');
+
 // tv = the user's tokenVersion at signing time; authRequired rejects the token once it has been bumped
 function signToken(user, companyId) {
   return jwt.sign(
@@ -110,16 +117,15 @@ const login = asyncHandler(async (req, res) => {
   if (!email || !password) return res.status(400).json({ error: 'email and password required' });
 
   const user = await prisma.user.findUnique({ where: { email }, include: { company: true } });
-  if (!user) return res.status(401).json({ error: 'Invalid credentials' });
+  // Always run bcrypt, even for an unknown email, so the response time doesn't reveal which emails
+  // are registered; and check the password before anything account-specific.
+  const valid = await bcrypt.compare(String(password), user ? user.passwordHash : DUMMY_PASSWORD_HASH);
+  if (!user || !valid) return res.status(401).json({ error: 'Invalid credentials' });
 
+  // Only someone who knows the password learns that the email is unverified or the account deactivated
   if (!user.emailVerified) {
-   return res.status(403).json({ error: 'Please verify your email before logging in' });
-}
-
-  const valid = await bcrypt.compare(password, user.passwordHash);
-  if (!valid) return res.status(401).json({ error: 'Invalid credentials' });
-
-  // checked after the password so the deactivated state isn't revealed to someone without it
+    return res.status(403).json({ error: 'Please verify your email before logging in' });
+  }
   if (!user.isActive || (user.company && !user.company.isActive)) {
     return res.status(403).json({ error: 'This account has been deactivated' });
   }
@@ -244,17 +250,18 @@ const forgotPassword = asyncHandler(async (req, res) => {
 
   await prisma.user.update({
     where: { id: user.id },
-    data: { resetToken, resetExpires },
+    data: { resetToken: hashToken(resetToken), resetExpires },
   });
 
-  // A failed send must not change the response, otherwise it reveals that the email exists.
+  // Respond before sending: waiting for the email API only for existing users would make the response
+  // time reveal that the email exists. A failed send is reported, never shown.
+  res.json({ ok: true });
   try {
     await sendPasswordResetEmail(user.email, resetToken);
   } catch (err) {
     console.error('Failed to send password reset email:', err);
     Sentry.captureException(err);
   }
-  res.json({ ok: true });
 });
 
 // POST /api/auth/reset-password
@@ -267,7 +274,8 @@ const resetPassword = asyncHandler(async (req, res) => {
   const invalid = passwordError(newPassword, 'newPassword');
   if (invalid) return res.status(400).json({ error: invalid });
 
-  const user = await prisma.user.findUnique({ where: { resetToken: token } });
+  if (typeof token !== 'string') return res.status(400).json({ error: 'Invalid or expired token' });
+  const user = await prisma.user.findUnique({ where: { resetToken: hashToken(token) } });
   if (!user) return res.status(400).json({ error: 'Invalid or expired token' });
 
   if (!user.resetExpires || user.resetExpires < new Date()) {
@@ -302,13 +310,14 @@ const resendVerification = asyncHandler(async (req, res) => {
     data: { verificationToken, verificationExpires },
   });
 
+  // respond first, for the same timing reason as forgot-password
+  res.json({ ok: true });
   try {
     await sendVerificationEmail(user.email, verificationToken);
   } catch (err) {
     console.error('Failed to resend verification email:', err);
     Sentry.captureException(err);
   }
-  res.json({ ok: true });
 });
 
 module.exports = { register, login, me, changePassword, deleteAccount, verifyEmail, forgotPassword, resetPassword, resendVerification };

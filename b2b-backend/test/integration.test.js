@@ -10,21 +10,24 @@ if (!['127.0.0.1', 'localhost'].includes(dbUrl.hostname) || !process.env.TEST_AP
   console.error('Refusing to run: integration tests only run against the local Postgres started by `npm test`.');
   process.exit(1);
 }
-process.env.JWT_SECRET = 'itest-secret';
+process.env.JWT_SECRET = 'itest-secret-0123456789-abcdefghij-long-enough';
 process.env.PORT = process.env.TEST_APP_PORT;
 process.env.RESEND_API_KEY = 're_test_dummy';
 process.env.SENTRY_DSN = '';
 
-// Stub Sentry so the hardcoded DSN never receives test events; captured errors are kept for assertions
+// Stub Sentry so no test event is ever sent; captured errors/messages are kept for assertions
 const sentryCaptured = [];
 const sentryPath = require.resolve('@sentry/node');
 require.cache[sentryPath] = { id: sentryPath, filename: sentryPath, loaded: true,
-  exports: { init() {}, setupExpressErrorHandler() {}, captureException(err, ctx) { sentryCaptured.push({ err, ctx }); } } };
+  exports: { init() {}, setupExpressErrorHandler() {}, captureException(err, ctx) { sentryCaptured.push({ err, ctx }); }, captureMessage(msg, level) { sentryCaptured.push({ msg, level }); } } };
 
-// Stub Resend so registration tests never call the real email API
+// Stub Resend so tests never call the real email API; sent emails are recorded, and a delay can be set
+// to simulate a slow email API
+const sentEmails = [];
+let emailDelayMs = 0;
 const resendPath = require.resolve('resend');
 require.cache[resendPath] = { id: resendPath, filename: resendPath, loaded: true,
-  exports: { Resend: class { constructor() { this.emails = { send: async () => ({ error: null }) }; } } } };
+  exports: { Resend: class { constructor() { this.emails = { send: async (msg) => { if (emailDelayMs) await new Promise((r) => setTimeout(r, emailDelayMs)); sentEmails.push(msg); return { error: null }; } }; } } } };
 
 const jwt = require('jsonwebtoken');
 const bcrypt = require('bcryptjs');
@@ -468,7 +471,10 @@ async function newRfq(budget = 500, extra = {}) {
   check('old password no longer logs in', (await login7('pw123456')).status === 401);
 
   check('forgot-password with different case/spaces -> 200', (await call('POST', '/auth/forgot-password', null, { email: '  SUP7@T.Test ' })).status === 200);
-  const rt = (await db.user.findUnique({ where: { id: 'u-sup7' } })).resetToken;
+  // the DB holds only a hash (L6); take the raw token from the email, like a real user would
+  await new Promise((res) => setTimeout(res, 100)); // the email is sent right after the response
+  const resetMail = [...sentEmails].reverse().find((m) => m.to === 'sup7@t.test' && /reset-password.html/.test(m.html));
+  const rt = resetMail && resetMail.html.match(/token=([0-9a-f]+)/)[1];
   check('reset token issued for the normalized email', !!rt);
   check('reset with 7-char password -> 400', (await call('POST', '/auth/reset-password', null, { token: rt, newPassword: 'short77' })).status === 400);
   check('reset password -> 200', (await call('POST', '/auth/reset-password', null, { token: rt, newPassword: 'resetpass9' })).status === 200);
@@ -597,7 +603,61 @@ async function newRfq(budget = 500, extra = {}) {
   check('rejected duplicate quote sends no notification', (await call('POST', `/rfqs/${nq.id}/quotes`, S2, { price: 60 })).status === 409 &&
     (await db.notification.count({ where: { companyId: 'buyer1', type: 'NEW_QUOTE' } })) === notesBefore + 1);
 
-  console.log('\n== 18. L1 errors -> 4xx ==');
+  console.log('\n== 18. L5 login order/timing, L6 hashed reset tokens, L8 startup checks ==');
+  // own client IP: authLimiter allows 10 failed logins per 15 min and earlier sections used some
+  const FROM = { 'X-Forwarded-For': '198.51.100.9, 10.0.0.1' };
+  const loginAs = (email, password) => call('POST', '/auth/login', null, { email, password }, undefined, FROM);
+  await db.user.create({ data: { id: 'u-unv', email: 'unverified@t.test', passwordHash: await bcrypt.hash('pw123456', 10), role: 'BUYER', emailVerified: false,
+    company: { create: { id: 'unv', name: 'Unverified Co', type: 'BUYER', wallet: { create: { balance: 0 } } } } } });
+  r = await loginAs('unverified@t.test', 'wrong-password');
+  check('unverified + wrong password -> 401 Invalid credentials (no hint)', r.status === 401 && r.data.error === 'Invalid credentials', r.data);
+  r = await loginAs('unverified@t.test', 'pw123456');
+  check('unverified + correct password -> 403 verify email', r.status === 403 && /verify your email/.test(r.data.error), r.data);
+  r = await loginAs('nobody@t.test', 'pw123456');
+  check('unknown email -> 401 Invalid credentials', r.status === 401 && r.data.error === 'Invalid credentials');
+  const timeLogin = async (email) => { const t0 = Date.now(); await loginAs(email, 'wrong-password'); return Date.now() - t0; };
+  const median = (xs) => xs.sort((a, b) => a - b)[Math.floor(xs.length / 2)];
+  const tUnknown = [], tKnown = [];
+  for (let i = 0; i < 3; i++) { tUnknown.push(await timeLogin('nobody' + i + '@t.test')); tKnown.push(await timeLogin('unverified@t.test')); }
+  check('unknown email takes about as long as a wrong password (bcrypt runs either way)', median(tUnknown) > median(tKnown) * 0.5, { unknownMs: tUnknown, knownMs: tKnown });
+
+  sentEmails.length = 0;
+  emailDelayMs = 1500;
+  const forgotStart = Date.now();
+  r = await call('POST', '/auth/forgot-password', null, { email: 'unverified@t.test' });
+  const forgotMs = Date.now() - forgotStart;
+  check('forgot-password answers before the (slow) email is sent', r.status === 200 && forgotMs < 1000, { forgotMs });
+  await new Promise((res) => setTimeout(res, 1700));
+  emailDelayMs = 0;
+  const mail = sentEmails.find((m) => /reset-password\.html\?token=/.test(m.html));
+  const rawToken = mail && mail.html.match(/token=([0-9a-f]+)/)[1];
+  const stored = (await db.user.findUnique({ where: { id: 'u-unv' } })).resetToken;
+  check('reset email sent with a raw token', !!rawToken && rawToken.length === 64);
+  check('database stores a SHA-256 hash, not the token', stored && stored !== rawToken && /^[0-9a-f]{64}$/.test(stored) &&
+    stored === require('crypto').createHash('sha256').update(rawToken).digest('hex'));
+  check('the stored hash does not work as a token', (await call('POST', '/auth/reset-password', null, { token: stored, newPassword: 'newpass123' })).status === 400);
+  check('non-string token -> 400', (await call('POST', '/auth/reset-password', null, { token: { $ne: null }, newPassword: 'newpass123' })).status === 400);
+  check('the emailed token resets the password', (await call('POST', '/auth/reset-password', null, { token: rawToken, newPassword: 'newpass123' })).status === 200);
+  check('token is single-use', (await call('POST', '/auth/reset-password', null, { token: rawToken, newPassword: 'another123' })).status === 400);
+
+  const { spawn } = require('child_process');
+  const startApp = (env, waitMs) => new Promise((resolve) => {
+    const child = spawn(process.execPath, ['-e', "require('./src/index.js')"], { cwd: root, env: { ...process.env, PORT: '0', ...env } });
+    let out = '';
+    child.stdout.on('data', (d) => { out += d; }); child.stderr.on('data', (d) => { out += d; });
+    const timer = setTimeout(() => { child.kill(); resolve({ code: 'running', out }); }, waitMs);
+    child.on('exit', (code) => { clearTimeout(timer); resolve({ code, out }); });
+  });
+  let boot = await startApp({ JWT_SECRET: '' }, 8000);
+  check('no JWT_SECRET -> server refuses to start (exit 1)', boot.code === 1 && /FATAL: JWT_SECRET is not set/.test(boot.out), boot);
+  boot = await startApp({ JWT_SECRET: 'short-secret' }, 4000);
+  check('weak JWT_SECRET -> starts, with a loud warning', boot.code === 'running' && /WARNING: JWT_SECRET is weak/.test(boot.out) && /SENTRY_DSN is not set/.test(boot.out), boot.out.slice(0, 300));
+  boot = await startApp({ JWT_SECRET: 'change_this_to_a_long_random_secret' }, 4000);
+  check('.env.example placeholder secret -> warning', /WARNING: JWT_SECRET is weak/.test(boot.out));
+  const src = require('fs').readFileSync(path.join(root, 'src/index.js'), 'utf8');
+  check('no Sentry DSN hardcoded in the source', !/ingest\.[a-z.]*sentry\.io/.test(src));
+
+  console.log('\n== 19. L1 errors -> 4xx ==');
   r = await call('GET', '/rfqs?status=FOO', B1);
   check('invalid RFQ status filter -> 400', r.status === 400 && /status must be one of/.test(r.data.error), r.data);
   check('invalid admin status filter -> 400', (await call('GET', '/admin/companies?status=FOO', ADM)).status === 400);
@@ -610,7 +670,7 @@ async function newRfq(budget = 500, extra = {}) {
   r = await call('PATCH', '/companies/me', ADM, { name: 'x' });
   check('admin without company PATCH /companies/me -> 4xx, not 500', r.status >= 400 && r.status < 500, r);
 
-  console.log('\n== 19. transaction timeout defaults ==');
+  console.log('\n== 20. transaction timeout defaults ==');
   const appPrisma = require(path.join(root, 'src/config/prisma'));
   const t0 = Date.now();
   try {
