@@ -269,6 +269,8 @@ model Order {
   lpoId     String      @unique
   lpo       LPO         @relation(fields: [lpoId], references: [id])
   status    OrderStatus @default(CONFIRMED)
+  // set when the buyer opens a dispute, so an admin can resume the order where it was
+  statusBeforeDispute OrderStatus?
   createdAt DateTime    @default(now())
   updatedAt DateTime    @updatedAt
 
@@ -325,8 +327,10 @@ model Message {
   id               String   @id @default(uuid())
   orderId          String
   order            Order    @relation(fields: [orderId], references: [id])
-  senderCompanyId  String
-  senderCompany    Company  @relation(fields: [senderCompanyId], references: [id])
+  // null: a comment by a platform admin (admins have no company), e.g. when resolving a dispute
+  senderCompanyId  String?
+  // Restrict as before: deleting a company must not turn its messages into admin comments
+  senderCompany    Company? @relation(fields: [senderCompanyId], references: [id], onDelete: Restrict, onUpdate: Cascade)
   body             String
   createdAt        DateTime @default(now())
 

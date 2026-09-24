@@ -741,6 +741,34 @@ async function newRfq(budget = 500, extra = {}) {
   }
   console.log('race winners:', raceOutcomes.join(', '));
 
+  console.log('\n== 18c2. L9 supplier notified of shortlist / rejection ==');
+  const settle = () => new Promise((res) => setTimeout(res, 150)); // notify() runs right after the response
+  const noteCount = (companyId, type, title) => db.notification.count({ where: { companyId, type, body: { contains: '"' + title + '"' } } });
+  const titled = async (title) => {
+    const rf = await newRfq(100, { title });
+    for (const [s, price] of [[S1, 50], [S2, 60], [S3, 70]]) await call('POST', `/rfqs/${rf.id}/quotes`, s, { price });
+    const qs = await db.quote.findMany({ where: { rfqId: rf.id }, orderBy: { price: 'asc' } });
+    return { q1: qs[0].id, q2: qs[1].id, q3: qs[2].id };
+  };
+  let nt = await titled('L9 notify A');
+  await sl(nt.q1); await sl(nt.q1); await rj(nt.q2); await rj(nt.q2);
+  await settle();
+  check('shortlist notifies the supplier once (repeat sends nothing)', (await noteCount('sup1', 'QUOTE_SHORTLISTED', 'L9 notify A')) === 1);
+  check('reject notifies the supplier once (repeat sends nothing)', (await noteCount('sup2', 'QUOTE_REJECTED', 'L9 notify A')) === 1);
+  const slNote = await db.notification.findFirst({ where: { companyId: 'sup1', type: 'QUOTE_SHORTLISTED', body: { contains: 'L9 notify A' } } });
+  check('notification does not name the buyer (M4)', !/Co buyer1/.test(slNote.title + slNote.body), slNote);
+  check('failed transition sends nothing', (await sl(nt.q2)).status === 400 && (await settle(), await noteCount('sup2', 'QUOTE_SHORTLISTED', 'L9 notify A')) === 0);
+  check('other buyer / supplier attempts send nothing', (await rj(nt.q3, B2)).status === 403 && (await rj(nt.q3, S3)).status === 403 &&
+    (await settle(), await noteCount('sup3', 'QUOTE_REJECTED', 'L9 notify A')) === 0);
+
+  nt = await titled('L9 notify B');
+  await sl(nt.q2); await rj(nt.q3); await settle();
+  check('award -> 201', (await call('POST', `/quotes/${nt.q1}/award`, B1, {})).status === 201);
+  await settle();
+  check('auto-rejected (shortlisted) loser notified on award', (await noteCount('sup2', 'QUOTE_REJECTED', 'L9 notify B')) === 1);
+  check('already-rejected quote is not notified twice', (await noteCount('sup3', 'QUOTE_REJECTED', 'L9 notify B')) === 1);
+  check('winner gets AWARDED, not QUOTE_REJECTED', (await noteCount('sup1', 'AWARDED', 'L9 notify B')) === 1 && (await noteCount('sup1', 'QUOTE_REJECTED', 'L9 notify B')) === 0);
+
   console.log('\n== 18d. L6 change-password attempts limited per user ==');
   await mkCo('sup11', 'SUPPLIER', 0); await mkCo('sup12', 'SUPPLIER', 0);
   const T11 = (await call('POST', '/auth/login', null, { email: 'sup11@t.test', password: 'pw123456' }, undefined, { 'X-Forwarded-For': '192.0.2.11, 10.0.0.1' })).data.token;
