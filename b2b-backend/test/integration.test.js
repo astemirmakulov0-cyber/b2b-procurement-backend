@@ -741,6 +741,33 @@ async function newRfq(budget = 500, extra = {}) {
   }
   console.log('race winners:', raceOutcomes.join(', '));
 
+  console.log('\n== 18d. L6 change-password attempts limited per user ==');
+  await mkCo('sup11', 'SUPPLIER', 0); await mkCo('sup12', 'SUPPLIER', 0);
+  const T11 = (await call('POST', '/auth/login', null, { email: 'sup11@t.test', password: 'pw123456' }, undefined, { 'X-Forwarded-For': '192.0.2.11, 10.0.0.1' })).data.token;
+  const T12 = (await call('POST', '/auth/login', null, { email: 'sup12@t.test', password: 'pw123456' }, undefined, { 'X-Forwarded-For': '192.0.2.12, 10.0.0.1' })).data.token;
+  const chpw = (tokn, currentPassword, newPassword = 'brandnew123') => call('PATCH', '/auth/password', tokn, { currentPassword, newPassword });
+  const codes11 = [];
+  for (let i = 0; i < 3; i++) codes11.push((await chpw(T11, 'pw123456', 'short')).status);   // validation errors
+  check('validation errors (400) are not counted', codes11.every((c) => c === 400), codes11);
+  const wrong = [];
+  for (let i = 0; i < 5; i++) wrong.push((await chpw(T11, 'wrong-' + i)).status);
+  check('5 wrong current passwords -> 401 each', wrong.every((c) => c === 401), wrong);
+  r = await chpw(T11, 'wrong-6');
+  check('6th wrong attempt -> 429', r.status === 429 && /Too many wrong password attempts/.test(r.data.error), r.data);
+  r = await chpw(T11, 'pw123456');
+  check('even the correct password is refused while blocked (no more guesses)', r.status === 429);
+  check('password unchanged while blocked', (await call('POST', '/auth/login', null, { email: 'sup11@t.test', password: 'pw123456' }, undefined, { 'X-Forwarded-For': '192.0.2.11, 10.0.0.1' })).status === 200);
+  r = await chpw(T12, 'wrong-a');
+  check('another user is not affected by that limit', r.status === 401);
+  r = await chpw(T12, 'pw123456');
+  check('another user can still change the password', r.status === 200 && !!r.data.token);
+  const T12b = r.data.token;
+  const ok12 = [];
+  for (let i = 0; i < 3; i++) ok12.push((await chpw(T12b, 'wrong-b' + i)).status);   // 1 + 3 = 4 failures
+  r = await chpw(T12b, 'brandnew123', 'brandnew456');
+  // if the successful change had counted, this would be the 5th strike and get 429
+  check('successful change does not use the budget (1 wrong + success + 3 wrong, then success)', ok12.every((c) => c === 401) && r.status === 200, { ok12, last: r.status });
+
   console.log('\n== 19. L1 errors -> 4xx ==');
   r = await call('GET', '/rfqs?status=FOO', B1);
   check('invalid RFQ status filter -> 400', r.status === 400 && /status must be one of/.test(r.data.error), r.data);
