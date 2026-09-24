@@ -81,6 +81,10 @@ enum PaymentStatus {
   REFUNDED
 }
 
+enum Currency {
+  BHD
+}
+
 enum WalletTxType {
   TOPUP
   BID_DEBIT
@@ -143,6 +147,8 @@ model CompanyDocument {
   fileUrl   String
   docType   String
   uploadedAt DateTime @default(now())
+
+  @@index([companyId])
 }
 
 model Wallet {
@@ -164,6 +170,9 @@ model WalletTransaction {
   type      WalletTxType
   reference String?
   createdAt DateTime     @default(now())
+
+  // wallet history: WHERE walletId ORDER BY createdAt DESC
+  @@index([walletId, createdAt])
 }
 
 model RFQ {
@@ -185,6 +194,10 @@ model RFQ {
   // history of purchase orders: a declined LPO stays, and the RFQ can be awarded again.
   // At most one non-declined LPO per RFQ is enforced in code under the RFQ row lock.
   lpos   LPO[]
+
+  @@index([buyerCompanyId])
+  // supplier feed: WHERE status = PUBLISHED ORDER BY createdAt DESC
+  @@index([status, createdAt])
 }
 
 model Quote {
@@ -194,7 +207,7 @@ model Quote {
   supplierCompanyId  String
   supplierCompany    Company     @relation("SupplierQuotes", fields: [supplierCompanyId], references: [id])
   price              Decimal     @db.Decimal(12, 3)
-  currency           String      @default("BHD")
+  currency           Currency    @default(BHD)
   deliveryTimeDays   Int?
   notes              String?
   status             QuoteStatus @default(SUBMITTED)
@@ -207,6 +220,9 @@ model Quote {
 
   // one quote per supplier per RFQ (also enforced in submitQuote; this is the DB-level guarantee)
   @@unique([rfqId, supplierCompanyId])
+
+  // rfqId is covered by the unique (rfqId, supplierCompanyId) above
+  @@index([supplierCompanyId])
 }
 
 model CatalogItem {
@@ -222,6 +238,8 @@ model CatalogItem {
   isActive          Boolean  @default(true)
   createdAt         DateTime @default(now())
   updatedAt         DateTime @updatedAt
+
+  @@index([supplierCompanyId])
 }
 
 model LPO {
@@ -243,6 +261,9 @@ model LPO {
   order Order?
 
   @@index([rfqId])
+
+  @@index([buyerCompanyId])
+  @@index([supplierCompanyId])
 }
 
 model Order {
@@ -298,6 +319,8 @@ model Payment {
   decidedAt DateTime?
   rejectReason String?
   createdAt DateTime      @default(now())
+
+  @@index([invoiceId])
 }
 
 model Message {
@@ -308,6 +331,9 @@ model Message {
   senderCompany    Company  @relation(fields: [senderCompanyId], references: [id])
   body             String
   createdAt        DateTime @default(now())
+
+  // chat: WHERE orderId ORDER BY createdAt
+  @@index([orderId, createdAt])
 }
 
 model Notification {
@@ -320,4 +346,7 @@ model Notification {
   relatedOrderId String?
   read           Boolean  @default(false)
   createdAt      DateTime @default(now())
+
+  // bell: WHERE companyId ORDER BY createdAt DESC LIMIT 50; read-all: WHERE companyId AND read = false
+  @@index([companyId, createdAt])
 }
