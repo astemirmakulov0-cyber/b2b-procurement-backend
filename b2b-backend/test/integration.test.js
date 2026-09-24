@@ -15,10 +15,11 @@ process.env.PORT = process.env.TEST_APP_PORT;
 process.env.RESEND_API_KEY = 're_test_dummy';
 process.env.SENTRY_DSN = '';
 
-// Stub Sentry so the hardcoded DSN never receives test events
+// Stub Sentry so the hardcoded DSN never receives test events; captured errors are kept for assertions
+const sentryCaptured = [];
 const sentryPath = require.resolve('@sentry/node');
 require.cache[sentryPath] = { id: sentryPath, filename: sentryPath, loaded: true,
-  exports: { init() {}, setupExpressErrorHandler() {}, captureException() {} } };
+  exports: { init() {}, setupExpressErrorHandler() {}, captureException(err, ctx) { sentryCaptured.push({ err, ctx }); } } };
 
 // Stub Resend so registration tests never call the real email API
 const resendPath = require.resolve('resend');
@@ -542,7 +543,21 @@ async function newRfq(budget = 500, extra = {}) {
   check('company objects expose only id and name', Object.keys(ordBuyerRow.lpo.supplierCompany).sort().join() === 'id,name');
   check('other supplier cannot read the order -> 403', (await call('GET', `/orders/${mo.id}`, S1)).status === 403);
 
-  console.log('\n== 16. L1 errors -> 4xx ==');
+  console.log('\n== 16. M16 notify() failures are reported ==');
+  const { notify } = require(path.join(root, 'src/utils/notify'));
+  const before16 = sentryCaptured.length;
+  let threw = false;
+  try { await notify('no-such-company', 'TEST_TYPE', 'Title', 'Body', 'ord-1'); } catch (e) { threw = true; }
+  const cap = sentryCaptured[sentryCaptured.length - 1];
+  check('failing notify() does not throw', !threw);
+  check('failing notify() is sent to Sentry with type and ids', sentryCaptured.length === before16 + 1 &&
+    cap.ctx.tags.area === 'notify' && cap.ctx.tags.notificationType === 'TEST_TYPE' && cap.ctx.extra.companyId === 'no-such-company' && cap.ctx.extra.relatedOrderId === 'ord-1',
+    cap && cap.ctx);
+  const okBefore = sentryCaptured.length;
+  await notify('buyer1', 'TEST_OK', 'ok');
+  check('successful notify() creates the row and reports nothing', sentryCaptured.length === okBefore && (await db.notification.count({ where: { companyId: 'buyer1', type: 'TEST_OK' } })) === 1);
+
+  console.log('\n== 17. L1 errors -> 4xx ==');
   r = await call('GET', '/rfqs?status=FOO', B1);
   check('invalid RFQ status filter -> 400', r.status === 400 && /status must be one of/.test(r.data.error), r.data);
   check('invalid admin status filter -> 400', (await call('GET', '/admin/companies?status=FOO', ADM)).status === 400);
@@ -555,7 +570,7 @@ async function newRfq(budget = 500, extra = {}) {
   r = await call('PATCH', '/companies/me', ADM, { name: 'x' });
   check('admin without company PATCH /companies/me -> 4xx, not 500', r.status >= 400 && r.status < 500, r);
 
-  console.log('\n== 17. transaction timeout defaults ==');
+  console.log('\n== 18. transaction timeout defaults ==');
   const appPrisma = require(path.join(root, 'src/config/prisma'));
   const t0 = Date.now();
   try {
