@@ -5,7 +5,10 @@ const { notify } = require('../utils/notify');
 async function loadOrderWithAccessCheck(orderId, user) {
   const order = await prisma.order.findUnique({
     where: { id: orderId },
-    include: { lpo: true, delivery: true, invoice: { include: { payments: true } } },
+    include: {
+      lpo: { include: { buyerCompany: { select: { id: true, name: true } }, supplierCompany: { select: { id: true, name: true } } } },
+      delivery: true, invoice: { include: { payments: true } },
+    },
   });
   if (!order) return { error: { status: 404, message: 'Order not found' } };
   const isBuyer = order.lpo.buyerCompanyId === user.companyId;
@@ -23,7 +26,14 @@ const listOrders = asyncHandler(async (req, res) => {
     : { lpo: { buyerCompanyId: req.user.companyId } };
   const orders = await prisma.order.findMany({
     where,
-    include: { lpo: { select: { totalAmount: true, rfq: { select: { title: true } } } }, delivery: true, invoice: true },
+    // LPO number and both company names for the order rows (buyer and supplier know each other once awarded)
+    include: {
+      lpo: { select: {
+        id: true, totalAmount: true, rfq: { select: { title: true } },
+        buyerCompany: { select: { id: true, name: true } }, supplierCompany: { select: { id: true, name: true } },
+      } },
+      delivery: true, invoice: true,
+    },
     orderBy: { createdAt: 'desc' },
   });
   res.json(orders);

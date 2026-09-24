@@ -514,7 +514,35 @@ async function newRfq(budget = 500, extra = {}) {
   r = await call('PATCH', '/companies/me', S8, { name: 'Another Name' });
   check('not verified: name change keeps PENDING', r.data.reverificationRequired === false && (await coStatus('sup8')) === 'PENDING');
 
-  console.log('\n== 15. L1 errors -> 4xx ==');
+  console.log('\n== 15. M12 budget required to publish, M13 order rows show LPO and counterparty ==');
+  const noBudget = { title: 'nb', description: 'x', deadline: future() };
+  r = await call('POST', '/rfqs', B1, { ...noBudget, publish: true });
+  check('publish without budget -> 400', r.status === 400 && /budget is required/.test(r.data.error), r.data);
+  r = await call('POST', '/rfqs', B1, noBudget);
+  check('draft without budget -> 201 DRAFT', r.status === 201 && r.data.status === 'DRAFT', r.data);
+  const draftId = r.data.id;
+  r = await call('PATCH', `/rfqs/${draftId}`, B1, { status: 'PUBLISHED' });
+  check('publish draft that has no budget -> 400', r.status === 400 && /budget is required/.test(r.data.error), r.data);
+  r = await call('PATCH', `/rfqs/${draftId}`, B1, { status: 'PUBLISHED', budget: null });
+  check('publish with budget: null -> 400', r.status === 400);
+  r = await call('PATCH', `/rfqs/${draftId}`, B1, { status: 'PUBLISHED', budget: 80 });
+  check('publish draft with budget in the same request -> 200 PUBLISHED', r.status === 200 && r.data.status === 'PUBLISHED' && Number(r.data.budget) === 80, r.data);
+  check('it can now receive a paid quote', (await call('POST', `/rfqs/${draftId}/quotes`, S1, { price: 70 })).status === 201);
+  const withBudgetDraft = (await call('POST', '/rfqs', B1, { ...noBudget, budget: 50 })).data;
+  check('publish a draft that already has a budget -> 200', (await call('PATCH', `/rfqs/${withBudgetDraft.id}`, B1, { status: 'PUBLISHED' })).status === 200);
+
+  const { order: mo } = await makeOrder(20, S2, 'sup2');
+  const lpoRow = await db.lPO.findFirst({ where: { order: { id: mo.id } } });
+  const ordBuyerRow = (await call('GET', '/orders', B1)).data.find((o) => o.id === mo.id);
+  check('buyer GET /orders: lpo.id + supplier name', ordBuyerRow && ordBuyerRow.lpo.id === lpoRow.id && ordBuyerRow.lpo.supplierCompany.name === 'Co sup2' && ordBuyerRow.lpo.buyerCompany.name === 'Co buyer1', ordBuyerRow && ordBuyerRow.lpo);
+  const ordSupRow = (await call('GET', '/orders', S2)).data.find((o) => o.id === mo.id);
+  check('supplier GET /orders: buyer name', ordSupRow && ordSupRow.lpo.buyerCompany.name === 'Co buyer1');
+  const detail = (await call('GET', `/orders/${mo.id}`, S2)).data;
+  check('GET /orders/:id includes both company names', detail.lpo.buyerCompany.name === 'Co buyer1' && detail.lpo.supplierCompany.name === 'Co sup2');
+  check('company objects expose only id and name', Object.keys(ordBuyerRow.lpo.supplierCompany).sort().join() === 'id,name');
+  check('other supplier cannot read the order -> 403', (await call('GET', `/orders/${mo.id}`, S1)).status === 403);
+
+  console.log('\n== 16. L1 errors -> 4xx ==');
   r = await call('GET', '/rfqs?status=FOO', B1);
   check('invalid RFQ status filter -> 400', r.status === 400 && /status must be one of/.test(r.data.error), r.data);
   check('invalid admin status filter -> 400', (await call('GET', '/admin/companies?status=FOO', ADM)).status === 400);
@@ -527,7 +555,7 @@ async function newRfq(budget = 500, extra = {}) {
   r = await call('PATCH', '/companies/me', ADM, { name: 'x' });
   check('admin without company PATCH /companies/me -> 4xx, not 500', r.status >= 400 && r.status < 500, r);
 
-  console.log('\n== 16. transaction timeout defaults ==');
+  console.log('\n== 17. transaction timeout defaults ==');
   const appPrisma = require(path.join(root, 'src/config/prisma'));
   const t0 = Date.now();
   try {

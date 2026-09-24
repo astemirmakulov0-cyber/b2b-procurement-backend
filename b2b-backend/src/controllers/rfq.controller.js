@@ -3,6 +3,8 @@ const asyncHandler = require('../utils/asyncHandler');
 const { CANCELLABLE_STATUSES, cancelRfqInTx } = require('../utils/rfqCancel');
 const { parseAmount } = require('../utils/money');
 
+const BUDGET_REQUIRED = 'budget is required to publish an RFQ (suppliers pay 5% of it to submit a quote)';
+
 // Returns { date } for a valid future deadline, { error } otherwise
 function parseDeadline(value) {
   const date = new Date(value);
@@ -26,6 +28,8 @@ const createRFQ = asyncHandler(async (req, res) => {
     if (parsed.error) return res.status(400).json({ error: parsed.error });
     budget = parsed.value;
   }
+  // The bid fee is 5% of the budget, so a published RFQ without one could never receive a quote
+  if (publish && budget === null) return res.status(400).json({ error: BUDGET_REQUIRED });
   let deadlineDate = null;
   if (deadline) {
     const parsed = parseDeadline(deadline);
@@ -167,6 +171,9 @@ const updateRFQ = asyncHandler(async (req, res) => {
       const allowed = BUYER_STATUS_TRANSITIONS[existing.status] || [];
       if (!allowed.includes(status)) {
         return { status: 400, error: `Cannot change RFQ status from ${existing.status} to ${status}` };
+      }
+      if (status === 'PUBLISHED' && budget === undefined && existing.budget === null) {
+        return { status: 400, error: BUDGET_REQUIRED };
       }
     }
 
