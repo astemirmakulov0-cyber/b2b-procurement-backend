@@ -81,10 +81,6 @@ enum PaymentStatus {
   REFUNDED
 }
 
-enum Currency {
-  BHD
-}
-
 enum WalletTxType {
   TOPUP
   BID_DEBIT
@@ -207,7 +203,9 @@ model Quote {
   supplierCompanyId  String
   supplierCompany    Company     @relation("SupplierQuotes", fields: [supplierCompanyId], references: [id])
   price              Decimal     @db.Decimal(12, 3)
-  currency           Currency    @default(BHD)
+  // only BHD for now: enforced in submitQuote and by the CHECK constraint "Quote_currency_bhd_check"
+  // (migration 1_l2_l3; Prisma schema can't express CHECK constraints)
+  currency           String      @default("BHD")
   deliveryTimeDays   Int?
   notes              String?
   status             QuoteStatus @default(SUBMITTED)

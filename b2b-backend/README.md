@@ -9,16 +9,33 @@ Node.js + Express + PostgreSQL (Prisma ORM) backend implementing the full core f
 ```bash
 npm install
 cp .env.example .env
-# отредактируйте .env: DATABASE_URL и JWT_SECRET
-npx prisma migrate dev --name init
+# отредактируйте .env: DATABASE_URL (ЛОКАЛЬНАЯ база) и JWT_SECRET
+npx prisma migrate deploy   # создаёт схему из prisma/migrations
 npm run dev
 ```
 
-Требуется PostgreSQL (локально, Docker или облачный — например, Supabase/Neon/Railway).
-Пример для Docker:
+`.env` всегда указывает на **локальную** базу. URL продовой базы хранится только в `.env.production` (в git не попадает, см. `.gitignore`) и передаётся явно в одну команду — см. раздел «Миграции».
+
+Локальный PostgreSQL, например через Docker:
 ```bash
 docker run --name b2b-db -e POSTGRES_PASSWORD=password -e POSTGRES_DB=b2b_procurement -p 5432:5432 -d postgres:16
 ```
+
+## Миграции базы
+
+Схема меняется только через файлы в `prisma/migrations` (baseline `0_init` — схема прода на 2026-09-24). `prisma db push` больше не используется ни локально для прода, ни на Railway (стартовая команда сервиса — `npm start`).
+
+1. Изменить `prisma/schema.prisma`.
+2. Создать миграцию на **локальной** базе: `npx prisma migrate dev --create-only --name <что_меняем>`, затем прочитать и при необходимости поправить `migration.sql` (например, Prisma генерирует `DROP COLUMN`/`ADD COLUMN` при смене типа — такое переписывается вручную на безопасный `ALTER`).
+3. `npm test` — поднимает временный локальный PostgreSQL, применяет миграции через `migrate deploy`, проверяет, что они дают ровно `schema.prisma`, и прогоняет интеграционные тесты. Прод не трогает.
+4. Применить на проде **до** выкатки кода, которому нужна новая схема (URL передаётся только этой команде):
+   ```bash
+   DATABASE_URL="$(node -e "require('dotenv').config({path:'.env.production'});process.stdout.write(process.env.DATABASE_URL)")" npx prisma migrate deploy
+   ```
+   Статус: та же команда с `migrate status` вместо `migrate deploy`.
+5. Выкатить код.
+
+Никогда не запускайте против прода `prisma migrate dev`, `prisma migrate reset` и `prisma db push`: первые две могут пересоздать базу, третья расходится с историей миграций.
 
 ## 2. Структура данных (Prisma models)
 
@@ -68,14 +85,15 @@ JWT в заголовке `Authorization: Bearer <token>`. Роли: `BUYER`, `S
 
 **Счета и оплата**
 - `GET /api/invoices`, `GET /api/invoices/:id`
-- `POST /api/invoices/:id/payments` (buyer) — фиксирует платёж, при полной оплате закрывает заказ
+- `POST /api/invoices/:id/payments` (buyer) — отмечает платёж (PENDING); Biddex платежи не проводит
+- `PATCH /api/payments/:id/confirm` / `reject` (supplier) — только подтверждённый платёж меняет статус счёта и заказа
 
 **Каталог поставщика**
 - `POST/GET/PATCH/DELETE /api/catalog`
 
 **Wallet (Bid Credits)**
 - `GET /api/wallet`
-- `POST /api/wallet/topup` `{ amount, reference }` — ⚠️ в проде подключить реальный платёжный шлюз перед начислением
+- `POST /api/wallet/topup` `{ companyId, amount, reference }` — только ADMIN (ручное начисление до подключения платёжного шлюза)
 
 ## 5. Что не входит в этот MVP-срез (Sprint 4 из сметы)
 

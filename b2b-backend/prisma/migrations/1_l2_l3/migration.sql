@@ -1,10 +1,9 @@
--- L2: Quote.currency becomes an enum (BHD only for now).
--- Hand-written instead of Prisma's generated DROP COLUMN + ADD COLUMN: the column is converted in
--- place, keeping every value, and the migration fails if any row holds something that isn't a Currency.
-CREATE TYPE "Currency" AS ENUM ('BHD');
-ALTER TABLE "Quote" ALTER COLUMN "currency" DROP DEFAULT;
-ALTER TABLE "Quote" ALTER COLUMN "currency" TYPE "Currency" USING ("currency"::"Currency");
-ALTER TABLE "Quote" ALTER COLUMN "currency" SET DEFAULT 'BHD';
+-- L2: Quote.currency is BHD only (for now).
+-- A CHECK constraint instead of an enum: the column stays text, so the code already running in
+-- production keeps working while the migration is applied (an enum column breaks the deployed Prisma
+-- client until new code is out). Validates existing rows: fails if any quote isn't BHD.
+-- To allow another currency later, replace the constraint in a new migration.
+ALTER TABLE "Quote" ADD CONSTRAINT "Quote_currency_bhd_check" CHECK ("currency" = 'BHD');
 
 -- L3: indexes on foreign keys and hot queries
 CREATE INDEX "CatalogItem_supplierCompanyId_idx" ON "CatalogItem"("supplierCompanyId");

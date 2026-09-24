@@ -666,9 +666,9 @@ async function newRfq(budget = 500, extra = {}) {
   check('quote in BHD -> 201, stored as BHD', r.status === 201 && r.data.currency === 'BHD', r.data);
   r = await call('POST', `/rfqs/${cq.id}/quotes`, S2, { price: 11 });
   check('quote without currency -> 201, stored as BHD', r.status === 201 && r.data.currency === 'BHD');
-  let enumRejects = false;
-  try { await db.$executeRawUnsafe(`UPDATE "Quote" SET currency = 'USD' WHERE id = '${r.data.id}'`); } catch (e) { enumRejects = /invalid input value for enum/.test(e.message); }
-  check('database itself refuses a non-BHD currency (enum)', enumRejects);
+  let checkRejects = false;
+  try { await db.$executeRawUnsafe(`UPDATE "Quote" SET currency = 'USD' WHERE id = '${r.data.id}'`); } catch (e) { checkRejects = /Quote_currency_bhd_check/.test(e.message); }
+  check('database itself refuses a non-BHD currency (CHECK constraint)', checkRejects);
 
   console.log('\n== 19. L1 errors -> 4xx ==');
   r = await call('GET', '/rfqs?status=FOO', B1);
