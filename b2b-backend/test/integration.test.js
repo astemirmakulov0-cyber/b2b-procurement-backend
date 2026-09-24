@@ -657,6 +657,19 @@ async function newRfq(budget = 500, extra = {}) {
   const src = require('fs').readFileSync(path.join(root, 'src/index.js'), 'utf8');
   check('no Sentry DSN hardcoded in the source', !/ingest\.[a-z.]*sentry\.io/.test(src));
 
+  console.log('\n== 18b. L2 Quote.currency is BHD only ==');
+  await db.wallet.updateMany({ where: { companyId: { in: ['sup1', 'sup2'] } }, data: { balance: 100 } });
+  const cq = await newRfq(100);
+  r = await call('POST', `/rfqs/${cq.id}/quotes`, S1, { price: 10, currency: 'USD' });
+  check('quote in USD -> 400 Only BHD is supported, no fee charged', r.status === 400 && r.data.error === 'Only BHD is supported' && (await bal('sup1')) === 100, r.data);
+  r = await call('POST', `/rfqs/${cq.id}/quotes`, S1, { price: 10, currency: 'BHD' });
+  check('quote in BHD -> 201, stored as BHD', r.status === 201 && r.data.currency === 'BHD', r.data);
+  r = await call('POST', `/rfqs/${cq.id}/quotes`, S2, { price: 11 });
+  check('quote without currency -> 201, stored as BHD', r.status === 201 && r.data.currency === 'BHD');
+  let enumRejects = false;
+  try { await db.$executeRawUnsafe(`UPDATE "Quote" SET currency = 'USD' WHERE id = '${r.data.id}'`); } catch (e) { enumRejects = /invalid input value for enum/.test(e.message); }
+  check('database itself refuses a non-BHD currency (enum)', enumRejects);
+
   console.log('\n== 19. L1 errors -> 4xx ==');
   r = await call('GET', '/rfqs?status=FOO', B1);
   check('invalid RFQ status filter -> 400', r.status === 400 && /status must be one of/.test(r.data.error), r.data);

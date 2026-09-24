@@ -48,7 +48,12 @@ async function postgresBinaries() {
       DATABASE_URL: `postgresql://test:test@127.0.0.1:${dbPort}/biddex_test`,
       TEST_APP_PORT: String(appPort),
     };
-    execFileSync(process.execPath, [require.resolve('prisma/build/index.js'), 'db', 'push', '--skip-generate'], { cwd: root, env, stdio: 'ignore' });
+    // Build the database from prisma/migrations exactly as production gets it, then make sure the
+    // migrations produce schema.prisma (a migration missing for a schema change fails the run).
+    const prismaCli = require.resolve('prisma/build/index.js');
+    execFileSync(process.execPath, [prismaCli, 'migrate', 'deploy'], { cwd: root, env, stdio: 'ignore' });
+    const drift = spawnSync(process.execPath, [prismaCli, 'migrate', 'diff', '--from-url', env.DATABASE_URL, '--to-schema-datamodel', 'prisma/schema.prisma', '--script', '--exit-code'], { cwd: root, env, encoding: 'utf8' });
+    if (drift.status !== 0) throw new Error('prisma/migrations do not match schema.prisma. Missing migration:\n' + drift.stdout);
 
     const run = spawnSync(process.execPath, [path.join(__dirname, 'integration.test.js')], { cwd: root, env, stdio: 'inherit' });
     code = run.status === null ? 1 : run.status;

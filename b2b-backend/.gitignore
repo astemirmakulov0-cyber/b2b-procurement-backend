@@ -1,2 +1,5 @@
 node_modules/
+# local secrets; .env.production holds the production DATABASE_URL and must never be committed
 .env
+.env.*
+!.env.example

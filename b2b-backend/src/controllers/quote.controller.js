@@ -16,6 +16,7 @@ const submitQuote = asyncHandler(async (req, res) => {
   const { price, currency, deliveryTimeDays, notes } = req.body;
   const parsedPrice = parseAmount(price, 'price');
   if (parsedPrice.error) return res.status(400).json({ error: parsedPrice.error });
+  if (currency !== undefined && currency !== 'BHD') return res.status(400).json({ error: 'Only BHD is supported' });
 
   const fail = (status, message) => Object.assign(new Error(message), { status });
 
@@ -59,7 +60,7 @@ const submitQuote = asyncHandler(async (req, res) => {
         rfqId,
         supplierCompanyId: req.user.companyId,
         price: parsedPrice.value,
-        currency: currency || 'BHD',
+        currency: 'BHD',
         deliveryTimeDays,
         notes,
       },
