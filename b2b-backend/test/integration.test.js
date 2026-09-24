@@ -304,7 +304,9 @@ async function newRfq(budget = 500, extra = {}) {
   check('buyer raises dispute -> 200', (await st(B1, 'DISPUTED')).status === 200 && (await ordStatus()) === 'DISPUTED');
   check('supplier cannot move a disputed order -> 400', (await st(S2, 'SHIPPED')).status === 400);
   check('delivery update on disputed order -> 400', (await call('PATCH', `/orders/${order1.id}/delivery`, S2, { status: 'DISPATCHED' })).status === 400);
-  check('admin resolves DISPUTED -> IN_PROGRESS -> 200', (await st(ADM, 'IN_PROGRESS')).status === 200);
+  check('admin cannot move orders via PATCH /status -> 400', (await st(ADM, 'IN_PROGRESS')).status === 400 && (await ordStatus()) === 'DISPUTED');
+  check('admin resumes the dispute -> 200, back to IN_PROGRESS',
+    (await call('POST', `/admin/orders/${order1.id}/resolve-dispute`, ADM, { action: 'RESUME', comment: 'ok' })).status === 200 && (await ordStatus()) === 'IN_PROGRESS');
   check('delivery invalid status -> 400', (await call('PATCH', `/orders/${order1.id}/delivery`, S2, { status: 'LOST' })).status === 400);
   check('delivery PENDING -> DELIVERED (skip) -> 400', (await call('PATCH', `/orders/${order1.id}/delivery`, S2, { status: 'DELIVERED' })).status === 400);
   check('delivery -> DISPATCHED -> 200, order SHIPPED', (await call('PATCH', `/orders/${order1.id}/delivery`, S2, { status: 'DISPATCHED', trackingInfo: 'TRK1' })).status === 200 && (await ordStatus()) === 'SHIPPED');
@@ -768,6 +770,113 @@ async function newRfq(budget = 500, extra = {}) {
   check('auto-rejected (shortlisted) loser notified on award', (await noteCount('sup2', 'QUOTE_REJECTED', 'L9 notify B')) === 1);
   check('already-rejected quote is not notified twice', (await noteCount('sup3', 'QUOTE_REJECTED', 'L9 notify B')) === 1);
   check('winner gets AWARDED, not QUOTE_REJECTED', (await noteCount('sup1', 'AWARDED', 'L9 notify B')) === 1 && (await noteCount('sup1', 'QUOTE_REJECTED', 'L9 notify B')) === 0);
+
+  console.log('\n== 18c3. L9 disputes: buyer opens with a reason, admin resumes or cancels ==');
+  const resolve = (id, body, tokn = ADM) => call('POST', `/admin/orders/${id}/resolve-dispute`, tokn, body);
+  const dispute = (id, body, tokn = B1) => call('PATCH', `/orders/${id}/status`, tokn, { status: 'DISPUTED', ...body });
+  const ordOf = (id) => db.order.findUnique({ where: { id } });
+  const notesOf = (companyId, type, orderId) => db.notification.findMany({ where: { companyId, type, relatedOrderId: orderId } });
+
+  // open with a reason; delivery dispatched first, so the order is SHIPPED
+  let dd = await makeOrder(80, S2, 'sup2');
+  await call('PATCH', `/orders/${dd.order.id}/delivery`, S2, { status: 'DISPATCHED' });
+  check('reason over 1000 chars -> 400', (await dispute(dd.order.id, { reason: 'x'.repeat(1001) })).status === 400 && (await ordOf(dd.order.id)).status === 'SHIPPED');
+  check('supplier cannot open a dispute -> 400', (await dispute(dd.order.id, { reason: 'no' }, S2)).status === 400);
+  r = await dispute(dd.order.id, { reason: '  Goods damaged on arrival  ' });
+  let o = await ordOf(dd.order.id);
+  check('buyer opens dispute with reason -> 200, remembers SHIPPED', r.status === 200 && o.status === 'DISPUTED' && o.statusBeforeDispute === 'SHIPPED', o);
+  let msgs = await db.message.findMany({ where: { orderId: dd.order.id } });
+  check('reason written to the order chat by the buyer', msgs.length === 1 && msgs[0].senderCompanyId === 'buyer1' && msgs[0].body === 'Dispute opened: Goods damaged on arrival', msgs);
+  await settle();
+  check('supplier notified with the reason', (await notesOf('sup2', 'ORDER_STATUS', dd.order.id)).some((n) => n.title === 'Order disputed' && n.body === 'Reason: Goods damaged on arrival'));
+
+  // admin list and chat access
+  r = await call('GET', '/admin/orders?status=DISPUTED', ADM);
+  const listed = r.status === 200 && r.data.find((x) => x.id === dd.order.id);
+  check('admin lists disputed orders with reason and both parties', !!listed && listed.disputeReason === 'Goods damaged on arrival' &&
+    listed.lpo.buyerCompany.name === 'Co buyer1' && listed.lpo.supplierCompany.name === 'Co sup2' && r.data.every((x) => x.status === 'DISPUTED'), listed);
+  check('admin list: invalid status -> 400', (await call('GET', '/admin/orders?status=FOO', ADM)).status === 400);
+  check('admin list: buyer / supplier -> 403', (await call('GET', '/admin/orders', B1)).status === 403 && (await call('GET', '/admin/orders', S2)).status === 403);
+  r = await call('GET', `/orders/${dd.order.id}/messages`, ADM);
+  check('admin reads the order chat -> 200', r.status === 200 && r.data.length === 1, r.data);
+  check('admin cannot post to the chat directly -> 403', (await call('POST', `/orders/${dd.order.id}/messages`, ADM, { body: 'hi' })).status === 403);
+  check('outsider still cannot read the chat -> 403', (await call('GET', `/orders/${dd.order.id}/messages`, S1)).status === 403);
+
+  // resolve: validation and access
+  check('resolve: bad action -> 400', (await resolve(dd.order.id, { action: 'COMPLETE', comment: 'x' })).status === 400);
+  check('resolve: missing / blank comment -> 400', (await resolve(dd.order.id, { action: 'RESUME' })).status === 400 && (await resolve(dd.order.id, { action: 'RESUME', comment: '   ' })).status === 400);
+  check('resolve: comment over 1000 chars -> 400', (await resolve(dd.order.id, { action: 'RESUME', comment: 'x'.repeat(1001) })).status === 400);
+  check('resolve: buyer / supplier -> 403', (await resolve(dd.order.id, { action: 'RESUME', comment: 'x' }, B1)).status === 403 && (await resolve(dd.order.id, { action: 'CANCEL', comment: 'x' }, S2)).status === 403);
+  check('resolve: unknown order -> 404', (await resolve('00000000-0000-0000-0000-000000000000', { action: 'RESUME', comment: 'x' })).status === 404);
+  check('...order still DISPUTED after rejected attempts', (await ordOf(dd.order.id)).status === 'DISPUTED');
+
+  // RESUME -> back to SHIPPED
+  r = await resolve(dd.order.id, { action: 'RESUME', comment: ' Supplier will replace the damaged units ' });
+  o = await ordOf(dd.order.id);
+  check('RESUME -> 200, back to SHIPPED, remembered status cleared', r.status === 200 && o.status === 'SHIPPED' && o.statusBeforeDispute === null, o);
+  msgs = await db.message.findMany({ where: { orderId: dd.order.id }, orderBy: { createdAt: 'asc' } });
+  check('admin comment in chat without a sender company', msgs.length === 2 && msgs[1].senderCompanyId === null &&
+    msgs[1].body === 'Dispute resolved — order resumed (shipped): Supplier will replace the damaged units', msgs[1]);
+  r = await call('GET', `/orders/${dd.order.id}/messages`, B1);
+  check('parties see the admin comment (senderCompany null)', r.status === 200 && r.data.length === 2 && r.data[1].senderCompany === null);
+  await settle();
+  check('both parties notified of the resolution', (await notesOf('buyer1', 'DISPUTE_RESOLVED', dd.order.id)).length === 1 && (await notesOf('sup2', 'DISPUTE_RESOLVED', dd.order.id)).length === 1 &&
+    (await notesOf('sup2', 'DISPUTE_RESOLVED', dd.order.id))[0].body === 'Supplier will replace the damaged units');
+  check('resolving again -> 400 (not DISPUTED)', (await resolve(dd.order.id, { action: 'CANCEL', comment: 'x' })).status === 400 && (await ordOf(dd.order.id)).status === 'SHIPPED');
+  check('supplier can continue delivery after resume', (await call('PATCH', `/orders/${dd.order.id}/delivery`, S2, { status: 'DELIVERED' })).status === 200 && (await ordOf(dd.order.id)).status === 'DELIVERED');
+
+  // dispute without a reason: no chat message, reason null
+  dd = await makeOrder(40, S2, 'sup2');
+  check('dispute without reason -> 200', (await dispute(dd.order.id, {})).status === 200);
+  check('...no chat message written', (await db.message.count({ where: { orderId: dd.order.id } })) === 0);
+  r = await call('GET', '/admin/orders?status=DISPUTED', ADM);
+  check('...admin list shows reason null', r.data.find((x) => x.id === dd.order.id).disputeReason === null);
+  // invoice fully paid during the dispute -> RESUME completes the order, as the payment would have
+  const inv = await db.invoice.findUnique({ where: { orderId: dd.order.id } });
+  r = await call('POST', `/invoices/${inv.id}/payments`, B1, { amount: Number(inv.amount), method: 'bank_transfer' });
+  await call('PATCH', `/payments/${r.data.payment.id}/confirm`, S2, {});
+  check('payment confirmed during dispute keeps the order DISPUTED', (await ordOf(dd.order.id)).status === 'DISPUTED' && (await db.invoice.findUnique({ where: { id: inv.id } })).status === 'PAID');
+  check('RESUME of a paid order -> COMPLETED', (await resolve(dd.order.id, { action: 'RESUME', comment: 'Paid, closing' })).status === 200 && (await ordOf(dd.order.id)).status === 'COMPLETED');
+
+  // CANCEL: pending payment fails, invoice without confirmed money is cancelled
+  dd = await makeOrder(60, S2, 'sup2');
+  r = await call('POST', `/invoices/${dd.invoice.id}/payments`, B1, { amount: 10, method: 'cash' });
+  const pendingId = r.data.payment.id;
+  await dispute(dd.order.id, { reason: 'Never delivered' });
+  r = await resolve(dd.order.id, { action: 'CANCEL', comment: 'Supplier did not deliver' });
+  check('CANCEL -> 200, order CANCELLED', r.status === 200 && (await ordOf(dd.order.id)).status === 'CANCELLED');
+  check('...pending payment FAILED, invoice CANCELLED', (await db.payment.findUnique({ where: { id: pendingId } })).status === 'FAILED' &&
+    (await db.invoice.findUnique({ where: { id: dd.invoice.id } })).status === 'CANCELLED');
+  check('...admin comment says cancelled', (await db.message.findFirst({ where: { orderId: dd.order.id, senderCompanyId: null } })).body === 'Dispute resolved — order cancelled: Supplier did not deliver');
+  await settle();
+  check('...both parties notified', (await notesOf('buyer1', 'DISPUTE_RESOLVED', dd.order.id))[0]?.title === 'Dispute resolved: order cancelled' && (await notesOf('sup2', 'DISPUTE_RESOLVED', dd.order.id)).length === 1);
+
+  // CANCEL keeps an invoice that has confirmed money on it
+  dd = await makeOrder(60, S2, 'sup2');
+  r = await call('POST', `/invoices/${dd.invoice.id}/payments`, B1, { amount: 20, method: 'cash' });
+  await call('PATCH', `/payments/${r.data.payment.id}/confirm`, S2, {});
+  await dispute(dd.order.id, {});
+  check('CANCEL with confirmed money -> invoice kept PARTIALLY_PAID', (await resolve(dd.order.id, { action: 'CANCEL', comment: 'Refund off-platform' })).status === 200 &&
+    (await db.invoice.findUnique({ where: { id: dd.invoice.id } })).status === 'PARTIALLY_PAID');
+
+  // disputes opened before statusBeforeDispute existed: RESUME falls back to what the delivery proves
+  dd = await makeOrder(30, S2, 'sup2');
+  await call('PATCH', `/orders/${dd.order.id}/status`, S2, { status: 'IN_PROGRESS' });
+  await dispute(dd.order.id, {});
+  await db.order.update({ where: { id: dd.order.id }, data: { statusBeforeDispute: null } });
+  check('RESUME without remembered status, delivery PENDING -> CONFIRMED', (await resolve(dd.order.id, { action: 'RESUME', comment: 'x' })).status === 200 && (await ordOf(dd.order.id)).status === 'CONFIRMED');
+
+  // RESUME and CANCEL at the same time: exactly one wins
+  for (let round = 1; round <= 4; round++) {
+    dd = await makeOrder(20, S2, 'sup2');
+    await dispute(dd.order.id, {});
+    const [a1, a2] = await Promise.all([resolve(dd.order.id, { action: 'RESUME', comment: 'r' }), resolve(dd.order.id, { action: 'CANCEL', comment: 'c' })]);
+    o = await ordOf(dd.order.id);
+    const adminMsgs = await db.message.count({ where: { orderId: dd.order.id, senderCompanyId: null } });
+    check(`resume vs cancel race (round ${round}): one 200 + one 400, one admin comment`,
+      [a1.status, a2.status].sort().join() === '200,400' && adminMsgs === 1 && (a1.status === 200 ? o.status === 'CONFIRMED' : o.status === 'CANCELLED'),
+      { resume: a1.status, cancel: a2.status, order: o.status, adminMsgs });
+  }
 
   console.log('\n== 18d. L6 change-password attempts limited per user ==');
   await mkCo('sup11', 'SUPPLIER', 0); await mkCo('sup12', 'SUPPLIER', 0);
