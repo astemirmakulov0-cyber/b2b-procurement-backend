@@ -1,7 +1,7 @@
 const prisma = require('../config/prisma');
 const asyncHandler = require('../utils/asyncHandler');
 const { notify } = require('../utils/notify');
-const { MONEY_DECIMALS, parseAmount } = require('../utils/money');
+const { MONEY_DECIMALS, parseAmount, formatAmount } = require('../utils/money');
 
 const BID_FEE_PERCENT = 0.05; // supplier pays 5% of the RFQ's budget to submit a quote
 
@@ -64,10 +64,13 @@ const submitQuote = asyncHandler(async (req, res) => {
         notes,
       },
     });
-    return quote;
+    return { quote, rfq };
   });
 
-  res.status(201).json(result);
+  res.status(201).json(result.quote);
+  // after commit, so the buyer is only told about quotes that were actually stored
+  notify(result.rfq.buyerCompanyId, 'NEW_QUOTE', 'New quote received',
+    'A verified supplier quoted ' + formatAmount(result.quote.price) + ' BHD on "' + result.rfq.title + '". Open Compare bids to review it.');
 });
 
 // GET /api/rfqs/:rfqId/quotes  (buyer sees all offers to compare; supplier sees only their own)

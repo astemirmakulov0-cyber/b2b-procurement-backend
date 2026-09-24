@@ -4,12 +4,13 @@ const crypto = require('crypto');
 const asyncHandler = require('../utils/asyncHandler');
 const { notify } = require('../utils/notify');
 const { CANCELLABLE_STATUSES, cancelRfqInTx } = require('../utils/rfqCancel');
+const { DOC_TYPES, checkDocument, DOC_META } = require('../utils/documents');
 
 // GET /api/companies/me
 const getMyCompany = asyncHandler(async (req, res) => {
   const company = await prisma.company.findUnique({
     where: { id: req.user.companyId },
-    include: { documents: true, wallet: true },
+    include: { documents: { select: DOC_META, orderBy: { uploadedAt: 'desc' } }, wallet: true },
   });
   res.json(company);
 });
@@ -47,15 +48,32 @@ const updateMyCompany = asyncHandler(async (req, res) => {
 const addDocument = asyncHandler(async (req, res) => {
   const { fileUrl, docType } = req.body;
   if (!fileUrl || !docType) return res.status(400).json({ error: 'fileUrl and docType required' });
-  const doc = await prisma.companyDocument.create({
-    data: { companyId: req.user.companyId, fileUrl, docType },
-  });
-  // submitting a document moves verification into review
-  await prisma.company.update({
-    where: { id: req.user.companyId },
-    data: { verificationStatus: 'IN_REVIEW' },
+  if (!DOC_TYPES.includes(docType)) return res.status(400).json({ error: 'docType must be one of ' + DOC_TYPES.join(', ') });
+  const checked = checkDocument(fileUrl);
+  if (checked.error) return res.status(400).json({ error: checked.error });
+
+  const doc = await prisma.$transaction(async (tx) => {
+    const created = await tx.companyDocument.create({
+      data: { companyId: req.user.companyId, fileUrl, docType },
+      select: DOC_META,
+    });
+    // a new document puts an unverified/rejected company into the admin's queue; it doesn't
+    // un-verify an already verified one
+    await tx.company.updateMany({
+      where: { id: req.user.companyId, verificationStatus: { in: ['PENDING', 'REJECTED'] } },
+      data: { verificationStatus: 'IN_REVIEW' },
+    });
+    return created;
   });
   res.status(201).json(doc);
+});
+
+// GET /api/admin/companies/:id/documents/:docId  (admin) - one document with its file, for review
+const getCompanyDocument = asyncHandler(async (req, res) => {
+  const doc = await prisma.companyDocument.findFirst({ where: { id: req.params.docId, companyId: req.params.id } });
+  if (!doc) return res.status(404).json({ error: 'Document not found' });
+  res.set('Cache-Control', 'no-store');
+  res.json(doc);
 });
 
 // GET /api/admin/companies?status=PENDING
@@ -67,7 +85,7 @@ const listCompanies = asyncHandler(async (req, res) => {
   }
   const companies = await prisma.company.findMany({
     where: status ? { verificationStatus: status } : undefined,
-    include: { documents: true, user: { select: { email: true } }, wallet: { select: { balance: true } } },
+    include: { documents: { select: DOC_META, orderBy: { uploadedAt: 'desc' } }, user: { select: { email: true } }, wallet: { select: { balance: true } } },
     orderBy: { createdAt: 'desc' },
   });
   res.json(companies);
@@ -167,4 +185,4 @@ const deleteCompany = asyncHandler(async (req, res) => {
   });
 });
 
-module.exports = { getMyCompany, updateMyCompany, addDocument, listCompanies, setVerificationStatus, resetCompanyPassword, deleteCompany };
+module.exports = { getMyCompany, updateMyCompany, addDocument, getCompanyDocument, listCompanies, setVerificationStatus, resetCompanyPassword, deleteCompany };

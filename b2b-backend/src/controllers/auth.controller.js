@@ -6,6 +6,7 @@ const crypto = require('crypto');
 const Sentry = require('@sentry/node');
 const { CANCELLABLE_STATUSES, cancelRfqInTx } = require('../utils/rfqCancel');
 const { normalizeEmail, emailError, passwordError } = require('../utils/credentials');
+const { DOC_META } = require('../utils/documents');
 const { Resend } = require('resend');
 const resend = new Resend(process.env.RESEND_API_KEY);
 
@@ -135,7 +136,7 @@ const login = asyncHandler(async (req, res) => {
 const me = asyncHandler(async (req, res) => {
   const user = await prisma.user.findUnique({
     where: { id: req.user.id },
-    include: { company: { include: { wallet: true, documents: true } } },
+    include: { company: { include: { wallet: true, documents: { select: DOC_META, orderBy: { uploadedAt: 'desc' } } } } },
   });
   if (!user) return res.status(404).json({ error: 'User not found' });
   res.json({ id: user.id, email: user.email, role: user.role, company: user.company });

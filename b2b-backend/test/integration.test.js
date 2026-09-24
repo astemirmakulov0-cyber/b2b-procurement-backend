@@ -557,7 +557,47 @@ async function newRfq(budget = 500, extra = {}) {
   await notify('buyer1', 'TEST_OK', 'ok');
   check('successful notify() creates the row and reports nothing', sentryCaptured.length === okBefore && (await db.notification.count({ where: { companyId: 'buyer1', type: 'TEST_OK' } })) === 1);
 
-  console.log('\n== 17. L1 errors -> 4xx ==');
+  console.log('\n== 17. M15 verification documents, L9 new-quote notification ==');
+  const PDF = 'data:application/pdf;base64,' + Buffer.from('%PDF-1.4 test document').toString('base64');
+  const PNG = 'data:image/png;base64,' + Buffer.from([0x89, 0x50, 0x4e, 0x47, 1, 2, 3]).toString('base64');
+  await mkCo('sup9', 'SUPPLIER', 100);
+  await db.company.update({ where: { id: 'sup9' }, data: { verificationStatus: 'PENDING' } });
+  const S9 = tok('SUPPLIER', 'sup9');
+  const addDoc = (fileUrl, docType = 'TRADE_LICENSE', tokn = S9) => call('POST', '/companies/me/documents', tokn, { fileUrl, docType });
+  for (const [url, why] of [['javascript:alert(1)', 'javascript: URL'], ['https://evil.example/x.pdf', 'remote link'],
+    ['data:image/svg+xml;base64,' + Buffer.from('<svg onload="alert(1)"/>').toString('base64'), 'SVG'],
+    ['data:text/html;base64,' + Buffer.from('<script>alert(1)</script>').toString('base64'), 'HTML'],
+    ['data:application/pdf;base64,' + 'A'.repeat(2.9 * 1024 * 1024), 'over 2MB'], [PDF + '"onerror', 'broken base64']]) {
+    r = await addDoc(url);
+    check(`upload ${why} -> 400`, r.status === 400, r.data);
+  }
+  check('unknown docType -> 400', (await addDoc(PDF, 'PASSPORT')).status === 400);
+  r = await addDoc(PDF);
+  check('valid PDF -> 201 without file content in response', r.status === 201 && !('fileUrl' in r.data) && r.data.docType === 'TRADE_LICENSE', r.data);
+  const pdfId = r.data.id;
+  check('PENDING company -> IN_REVIEW after upload', (await db.company.findUnique({ where: { id: 'sup9' } })).verificationStatus === 'IN_REVIEW');
+  check('valid PNG -> 201', (await addDoc(PNG, 'CR_CERTIFICATE')).status === 201);
+  check('VERIFIED company stays VERIFIED after uploading', (await addDoc(PDF, 'OTHER', S1)).status === 201 && (await db.company.findUnique({ where: { id: 'sup1' } })).verificationStatus === 'VERIFIED');
+  const noContent = (docs) => Array.isArray(docs) && docs.length > 0 && docs.every((d) => !('fileUrl' in d) && d.id && d.docType && d.uploadedAt);
+  check('GET /companies/me: documents without file content', noContent((await call('GET', '/companies/me', S9)).data.documents));
+  check('GET /auth/me: documents without file content', noContent((await call('GET', '/auth/me', S9)).data.company.documents));
+  const adminRow = (await call('GET', '/admin/companies', ADM)).data.find((x) => x.id === 'sup9');
+  check('admin list: 2 documents, no file content', adminRow && adminRow.documents.length === 2 && noContent(adminRow.documents));
+  r = await call('GET', `/admin/companies/sup9/documents/${pdfId}`, ADM);
+  check('admin fetches one document with its file', r.status === 200 && r.data.fileUrl === PDF, r.status);
+  check('document id under another company -> 404', (await call('GET', `/admin/companies/sup1/documents/${pdfId}`, ADM)).status === 404);
+  check('non-admin cannot fetch documents -> 403', (await call('GET', `/admin/companies/sup9/documents/${pdfId}`, S9)).status === 403);
+
+  await db.wallet.update({ where: { companyId: 'sup2' }, data: { balance: 100 } });
+  const nq = (await call('POST', '/rfqs', B1, { title: 'Office desks', description: 'x', budget: 100, deadline: future(), publish: true })).data;
+  const notesBefore = await db.notification.count({ where: { companyId: 'buyer1', type: 'NEW_QUOTE' } });
+  check('supplier quotes -> 201', (await call('POST', `/rfqs/${nq.id}/quotes`, S2, { price: 64.5 })).status === 201);
+  const nqNote = await db.notification.findFirst({ where: { companyId: 'buyer1', type: 'NEW_QUOTE' }, orderBy: { createdAt: 'desc' } });
+  check('buyer notified of the new quote (amount + RFQ title, no supplier name)', nqNote && nqNote.body.includes('64.500 BHD') && nqNote.body.includes('Office desks') && !nqNote.body.includes('Co sup2'), nqNote && nqNote.body);
+  check('rejected duplicate quote sends no notification', (await call('POST', `/rfqs/${nq.id}/quotes`, S2, { price: 60 })).status === 409 &&
+    (await db.notification.count({ where: { companyId: 'buyer1', type: 'NEW_QUOTE' } })) === notesBefore + 1);
+
+  console.log('\n== 18. L1 errors -> 4xx ==');
   r = await call('GET', '/rfqs?status=FOO', B1);
   check('invalid RFQ status filter -> 400', r.status === 400 && /status must be one of/.test(r.data.error), r.data);
   check('invalid admin status filter -> 400', (await call('GET', '/admin/companies?status=FOO', ADM)).status === 400);
@@ -570,7 +610,7 @@ async function newRfq(budget = 500, extra = {}) {
   r = await call('PATCH', '/companies/me', ADM, { name: 'x' });
   check('admin without company PATCH /companies/me -> 4xx, not 500', r.status >= 400 && r.status < 500, r);
 
-  console.log('\n== 18. transaction timeout defaults ==');
+  console.log('\n== 19. transaction timeout defaults ==');
   const appPrisma = require(path.join(root, 'src/config/prisma'));
   const t0 = Date.now();
   try {
