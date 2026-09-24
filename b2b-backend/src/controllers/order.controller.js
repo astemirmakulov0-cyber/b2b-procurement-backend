@@ -57,21 +57,41 @@ const SUPPLIER_TRANSITIONS = {
 const BUYER_TRANSITIONS = {
   CONFIRMED: ['DISPUTED'], IN_PROGRESS: ['DISPUTED'], SHIPPED: ['DISPUTED'], DELIVERED: ['DISPUTED'],
 };
-// an admin resolves disputes
-const ADMIN_TRANSITIONS = {
-  DISPUTED: ['IN_PROGRESS', 'SHIPPED', 'DELIVERED', 'COMPLETED', 'CANCELLED'],
-};
+// An admin leaves DISPUTED only via POST /api/admin/orders/:id/resolve-dispute (resume or cancel).
 
-// PATCH /api/orders/:id/status  body: { status }
+const MAX_COMMENT = 1000;
+// Written by the server into the order chat; the admin dispute list reads the reason back by this prefix.
+const DISPUTE_PREFIX = 'Dispute opened: ';
+
+const statusLabel = (s) => s.toLowerCase().replace('_', ' ');
+
+// Cancelling an order closes its invoice: pending payments fail, and an invoice without confirmed money
+// is cancelled (one with confirmed money is kept as is — refunds are handled outside the platform).
+// The caller holds the invoice row lock (the same lock as payments).
+async function closeInvoiceOnCancel(tx, invoiceId) {
+  await tx.payment.updateMany({
+    where: { invoiceId, status: 'PENDING' },
+    data: { status: 'FAILED', decidedAt: new Date(), rejectReason: 'Order cancelled' },
+  });
+  const confirmed = await tx.payment.count({ where: { invoiceId, status: 'COMPLETED' } });
+  if (confirmed === 0) await tx.invoice.update({ where: { id: invoiceId }, data: { status: 'CANCELLED' } });
+}
+
+// PATCH /api/orders/:id/status  body: { status, reason? }  (reason: the buyer opening a dispute)
 const updateOrderStatus = asyncHandler(async (req, res) => {
   const { status } = req.body;
   if (!ORDER_STATUSES.includes(status)) {
     return res.status(400).json({ error: 'status must be one of ' + ORDER_STATUSES.join(', ') });
   }
+  if (req.user.role === 'ADMIN') {
+    return res.status(400).json({ error: 'Admins change orders only by resolving a dispute' });
+  }
+  const reason = status === 'DISPUTED' && typeof req.body.reason === 'string' ? req.body.reason.trim() : '';
+  if (reason.length > MAX_COMMENT) return res.status(400).json({ error: `reason must be at most ${MAX_COMMENT} characters` });
   const { order, isSupplier, isBuyer, error } = await loadOrderWithAccessCheck(req.params.id, req.user);
   if (error) return res.status(error.status).json({ error: error.message });
 
-  const table = req.user.role === 'ADMIN' ? ADMIN_TRANSITIONS : isSupplier ? SUPPLIER_TRANSITIONS : isBuyer ? BUYER_TRANSITIONS : {};
+  const table = isSupplier ? SUPPLIER_TRANSITIONS : isBuyer ? BUYER_TRANSITIONS : {};
   if (!(table[order.status] || []).includes(status)) {
     return res.status(400).json({ error: `Cannot change order status from ${order.status} to ${status}` });
   }
@@ -81,30 +101,103 @@ const updateOrderStatus = asyncHandler(async (req, res) => {
   }
 
   const updated = await prisma.$transaction(async (tx) => {
-    // Only apply if nobody changed the status since we read it
-    const { count } = await tx.order.updateMany({ where: { id: order.id, status: order.status }, data: { status } });
+    // Only apply if nobody changed the status since we read it; a dispute remembers where the order was
+    const data = status === 'DISPUTED' ? { status, statusBeforeDispute: order.status } : { status };
+    const { count } = await tx.order.updateMany({ where: { id: order.id, status: order.status }, data });
     if (count === 0) throw Object.assign(new Error('Order status changed meanwhile; reload and try again'), { status: 409 });
+    if (status === 'DISPUTED' && reason) {
+      await tx.message.create({ data: { orderId: order.id, senderCompanyId: req.user.companyId, body: DISPUTE_PREFIX + reason } });
+    }
     if (status === 'CANCELLED' && order.invoice) {
       // same lock as payments, so no payment can be reported/confirmed while the invoice is being closed
       await tx.$queryRaw`SELECT id FROM "Invoice" WHERE id = ${order.invoice.id} FOR UPDATE`;
       if (isSupplier && await tx.payment.count({ where: { invoiceId: order.invoice.id, status: 'COMPLETED' } }) > 0) {
         throw Object.assign(new Error('Cannot cancel an order that has payments'), { status: 400 });
       }
-      await tx.payment.updateMany({
-        where: { invoiceId: order.invoice.id, status: 'PENDING' },
-        data: { status: 'FAILED', decidedAt: new Date(), rejectReason: 'Order cancelled' },
-      });
-      // an invoice with confirmed money on it is kept as is (refunds are handled outside the platform)
-      const confirmed = await tx.payment.count({ where: { invoiceId: order.invoice.id, status: 'COMPLETED' } });
-      if (confirmed === 0) await tx.invoice.update({ where: { id: order.invoice.id }, data: { status: 'CANCELLED' } });
+      await closeInvoiceOnCancel(tx, order.invoice.id);
     }
     return tx.order.findUnique({ where: { id: order.id } });
   });
   res.json(updated);
 
   const other = isBuyer ? order.lpo.supplierCompanyId : order.lpo.buyerCompanyId;
-  notify(other, 'ORDER_STATUS', 'Order ' + status.toLowerCase().replace('_', ' '), undefined, order.id);
-  if (req.user.role === 'ADMIN') notify(order.lpo.supplierCompanyId, 'ORDER_STATUS', 'Order ' + status.toLowerCase().replace('_', ' '), undefined, order.id);
+  notify(other, 'ORDER_STATUS', 'Order ' + statusLabel(status), reason ? 'Reason: ' + reason.slice(0, 300) : undefined, order.id);
+});
+
+// GET /api/admin/orders?status=DISPUTED  (admin) - orders with both parties and, for disputes, the buyer's reason
+const listOrdersAdmin = asyncHandler(async (req, res) => {
+  const { status } = req.query;
+  if (status !== undefined && !ORDER_STATUSES.includes(status)) {
+    return res.status(400).json({ error: 'status must be one of ' + ORDER_STATUSES.join(', ') });
+  }
+  const orders = await prisma.order.findMany({
+    where: status ? { status } : {},
+    include: {
+      lpo: { select: {
+        id: true, totalAmount: true, buyerCompanyId: true, rfq: { select: { title: true } },
+        buyerCompany: { select: { id: true, name: true } }, supplierCompany: { select: { id: true, name: true } },
+      } },
+      delivery: true, invoice: true,
+    },
+    orderBy: { updatedAt: 'desc' },
+  });
+  // the reason is the latest dispute message written by the buyer (null if the buyer gave none)
+  const reasons = orders.length === 0 ? [] : await prisma.message.findMany({
+    where: { orderId: { in: orders.map((o) => o.id) }, body: { startsWith: DISPUTE_PREFIX } },
+    select: { orderId: true, senderCompanyId: true, body: true },
+    orderBy: { createdAt: 'desc' },
+  });
+  res.json(orders.map((o) => {
+    const m = o.status === 'DISPUTED' && reasons.find((r) => r.orderId === o.id && r.senderCompanyId === o.lpo.buyerCompanyId);
+    return { ...o, disputeReason: m ? m.body.slice(DISPUTE_PREFIX.length) : null };
+  }));
+});
+
+// Where a resumed order goes when statusBeforeDispute is unknown (disputes opened before it was stored):
+// the furthest status the delivery proves.
+const STATUS_FROM_DELIVERY = { PENDING: 'CONFIRMED', DISPATCHED: 'SHIPPED', IN_TRANSIT: 'SHIPPED', FAILED: 'SHIPPED', DELIVERED: 'DELIVERED' };
+
+// POST /api/admin/orders/:id/resolve-dispute  (admin)  body: { action: 'RESUME' | 'CANCEL', comment }
+// RESUME returns the order to its status before the dispute (COMPLETED if the invoice got fully paid
+// meanwhile, as the payment would have done); CANCEL cancels it like a normal cancellation. The comment
+// goes to the order chat as an admin message and both parties are notified.
+const resolveDispute = asyncHandler(async (req, res) => {
+  const { action } = req.body;
+  const comment = typeof req.body.comment === 'string' ? req.body.comment.trim() : '';
+  if (!['RESUME', 'CANCEL'].includes(action)) return res.status(400).json({ error: 'action must be RESUME or CANCEL' });
+  if (!comment) return res.status(400).json({ error: 'comment required' });
+  if (comment.length > MAX_COMMENT) return res.status(400).json({ error: `comment must be at most ${MAX_COMMENT} characters` });
+
+  const order = await prisma.order.findUnique({ where: { id: req.params.id }, include: { lpo: true, invoice: true } });
+  if (!order) return res.status(404).json({ error: 'Order not found' });
+
+  const result = await prisma.$transaction(async (tx) => {
+    // invoice first, then order — the same lock order as confirming a payment
+    if (order.invoice) await tx.$queryRaw`SELECT id FROM "Invoice" WHERE id = ${order.invoice.id} FOR UPDATE`;
+    await tx.$queryRaw`SELECT id FROM "Order" WHERE id = ${order.id} FOR UPDATE`;
+    const current = await tx.order.findUnique({ where: { id: order.id }, include: { invoice: true, delivery: true } });
+    if (current.status !== 'DISPUTED') {
+      throw Object.assign(new Error(`Order is ${current.status}, not DISPUTED`), { status: 400 });
+    }
+
+    let to;
+    if (action === 'CANCEL') {
+      to = 'CANCELLED';
+      if (current.invoice) await closeInvoiceOnCancel(tx, current.invoice.id);
+    } else {
+      to = current.invoice && current.invoice.status === 'PAID' ? 'COMPLETED'
+        : current.statusBeforeDispute || STATUS_FROM_DELIVERY[current.delivery?.status] || 'CONFIRMED';
+    }
+    await tx.order.update({ where: { id: order.id }, data: { status: to, statusBeforeDispute: null } });
+    const verdict = action === 'CANCEL' ? 'order cancelled' : 'order resumed (' + statusLabel(to) + ')';
+    await tx.message.create({ data: { orderId: order.id, senderCompanyId: null, body: 'Dispute resolved — ' + verdict + ': ' + comment } });
+    return { order: await tx.order.findUnique({ where: { id: order.id } }), verdict };
+  });
+  res.json(result.order);
+
+  for (const companyId of [order.lpo.buyerCompanyId, order.lpo.supplierCompanyId]) {
+    notify(companyId, 'DISPUTE_RESOLVED', 'Dispute resolved: ' + result.verdict, comment.slice(0, 300), order.id);
+  }
 });
 
 const DELIVERY_TRANSITIONS = {
@@ -158,4 +251,4 @@ const updateDelivery = asyncHandler(async (req, res) => {
   notify(order.lpo.buyerCompanyId, 'DELIVERY', label, trackingInfo ? 'Tracking: ' + trackingInfo : undefined, order.id);
 });
 
-module.exports = { listOrders, getOrder, updateOrderStatus, updateDelivery };
+module.exports = { listOrders, getOrder, updateOrderStatus, updateDelivery, listOrdersAdmin, resolveDispute };

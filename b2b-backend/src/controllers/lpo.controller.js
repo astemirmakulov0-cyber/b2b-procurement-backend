@@ -1,6 +1,7 @@
 const prisma = require('../config/prisma');
 const asyncHandler = require('../utils/asyncHandler');
 const { notify } = require('../utils/notify');
+const { notifyQuoteStatus } = require('./quote.controller');
 
 // POST /api/quotes/:id/award  (buyer) - awards the quote, closes RFQ, creates LPO + Order
 const awardQuote = asyncHandler(async (req, res) => {
@@ -30,6 +31,11 @@ const awardQuote = asyncHandler(async (req, res) => {
     await tx.quote.update({ where: { id: quote.id }, data: { status: 'AWARDED', statusBeforeAward: current.status } });
     // Auto-reject the other open quotes, remembering their status so a declined LPO can restore them.
     // Quotes already REJECTED/WITHDRAWN are left alone.
+    // Read under the RFQ lock (submissions take it too), so this is exactly the set rejected below.
+    const losers = await tx.quote.findMany({
+      where: { rfqId: quote.rfqId, id: { not: quote.id }, status: { in: ['SUBMITTED', 'SHORTLISTED'] } },
+      select: { supplierCompanyId: true },
+    });
     for (const prev of ['SUBMITTED', 'SHORTLISTED']) {
       await tx.quote.updateMany({
         where: { rfqId: quote.rfqId, id: { not: quote.id }, status: prev },
@@ -49,11 +55,12 @@ const awardQuote = asyncHandler(async (req, res) => {
       },
     });
 
-    return lpo;
+    return { lpo, losers };
   });
 
-  res.status(201).json(result);
+  res.status(201).json(result.lpo);
   notify(quote.supplierCompanyId, 'AWARDED', 'You won an order', 'Your quote on "' + quote.rfq.title + '" was awarded.');
+  for (const q of result.losers) notifyQuoteStatus(q.supplierCompanyId, 'REJECTED', quote.rfq.title);
 });
 
 // PATCH /api/lpos/:id/accept  (supplier) - supplier accepts LPO, creates Order

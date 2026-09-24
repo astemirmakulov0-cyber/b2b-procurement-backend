@@ -116,14 +116,26 @@ function changeQuoteStatus(to, from) {
         throw Object.assign(new Error(`Cannot change quotes of an RFQ in ${rfq.status} status`), { status: 400 });
       }
       const current = await tx.quote.findUnique({ where: { id: quote.id } });
-      if (current.status === to) return current; // repeating the same action changes nothing
+      if (current.status === to) return { quote: current, changed: false }; // repeating the same action changes nothing
       if (!from.includes(current.status)) {
         throw Object.assign(new Error(`Cannot change a ${current.status} quote to ${to}`), { status: 400 });
       }
-      return tx.quote.update({ where: { id: quote.id }, data: { status: to } });
+      return { quote: await tx.quote.update({ where: { id: quote.id }, data: { status: to } }), changed: true };
     });
-    res.json(updated);
+    res.json(updated.quote);
+    // after commit and only on a real change; RFQ title only — the buyer stays anonymous until award (M4)
+    if (updated.changed) notifyQuoteStatus(quote.supplierCompanyId, to, quote.rfq.title);
   });
+}
+
+function notifyQuoteStatus(supplierCompanyId, status, rfqTitle) {
+  if (status === 'SHORTLISTED') {
+    notify(supplierCompanyId, 'QUOTE_SHORTLISTED', 'Your quote was shortlisted',
+      'The buyer shortlisted your quote on "' + rfqTitle + '".');
+  } else if (status === 'REJECTED') {
+    notify(supplierCompanyId, 'QUOTE_REJECTED', 'Your quote was not selected',
+      'The buyer did not select your quote on "' + rfqTitle + '".');
+  }
 }
 
 // PATCH /api/quotes/:id/shortlist  (buyer)
@@ -132,4 +144,4 @@ const shortlistQuote = changeQuoteStatus('SHORTLISTED', ['SUBMITTED']);
 // PATCH /api/quotes/:id/reject  (buyer)
 const rejectQuote = changeQuoteStatus('REJECTED', ['SUBMITTED', 'SHORTLISTED']);
 
-module.exports = { submitQuote, listQuotesForRFQ, shortlistQuote, rejectQuote };
+module.exports = { submitQuote, listQuotesForRFQ, shortlistQuote, rejectQuote, notifyQuoteStatus };

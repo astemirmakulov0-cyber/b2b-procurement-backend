@@ -17,6 +17,10 @@ router.get('/orders/:id', authRequired, orderCtrl.getOrder);
 router.patch('/orders/:id/status', authRequired, orderCtrl.updateOrderStatus);
 router.patch('/orders/:id/delivery', authRequired, requireRole('SUPPLIER'), orderCtrl.updateDelivery);
 
+// Admin: disputes
+router.get('/admin/orders', authRequired, requireRole('ADMIN'), orderCtrl.listOrdersAdmin);
+router.post('/admin/orders/:id/resolve-dispute', authRequired, requireRole('ADMIN'), orderCtrl.resolveDispute);
+
 // Order chat
 router.get('/orders/:orderId/messages', authRequired, messageCtrl.listMessages);
 router.post('/orders/:orderId/messages', authRequired, messageCtrl.sendMessage);
