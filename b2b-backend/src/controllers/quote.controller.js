@@ -96,30 +96,40 @@ const listQuotesForRFQ = asyncHandler(async (req, res) => {
   res.json(quotes);
 });
 
-// PATCH /api/quotes/:id/shortlist  (buyer)
-const shortlistQuote = asyncHandler(async (req, res) => {
-  const quote = await prisma.quote.findUnique({ where: { id: req.params.id }, include: { rfq: true } });
-  if (!quote) return res.status(404).json({ error: 'Quote not found' });
-  if (quote.rfq.buyerCompanyId !== req.user.companyId) return res.status(403).json({ error: 'Forbidden' });
+// The buyer evaluates quotes while the RFQ is open for evaluation: PUBLISHED, or QUOTING_CLOSED (bidding
+// closed but no winner yet — awarding is allowed there too, and a declined LPO returns the RFQ to it).
+// AWARDED and CANCELLED RFQs are final.
+const EVALUATION_RFQ_STATUSES = ['PUBLISHED', 'QUOTING_CLOSED'];
 
-  const updated = await prisma.quote.update({
-    where: { id: req.params.id },
-    data: { status: 'SHORTLISTED' },
+// Shared by shortlist/reject: `to` is the target status, `from` the statuses it may be reached from.
+// Runs under the same RFQ row lock as award/cancel, so e.g. reject and award of one quote can't both win.
+function changeQuoteStatus(to, from) {
+  return asyncHandler(async (req, res) => {
+    const quote = await prisma.quote.findUnique({ where: { id: req.params.id }, include: { rfq: true } });
+    if (!quote) return res.status(404).json({ error: 'Quote not found' });
+    if (quote.rfq.buyerCompanyId !== req.user.companyId) return res.status(403).json({ error: 'Forbidden' });
+
+    const updated = await prisma.$transaction(async (tx) => {
+      await tx.$queryRaw`SELECT id FROM "RFQ" WHERE id = ${quote.rfqId} FOR UPDATE`;
+      const rfq = await tx.rFQ.findUnique({ where: { id: quote.rfqId }, select: { status: true } });
+      if (!EVALUATION_RFQ_STATUSES.includes(rfq.status)) {
+        throw Object.assign(new Error(`Cannot change quotes of an RFQ in ${rfq.status} status`), { status: 400 });
+      }
+      const current = await tx.quote.findUnique({ where: { id: quote.id } });
+      if (current.status === to) return current; // repeating the same action changes nothing
+      if (!from.includes(current.status)) {
+        throw Object.assign(new Error(`Cannot change a ${current.status} quote to ${to}`), { status: 400 });
+      }
+      return tx.quote.update({ where: { id: quote.id }, data: { status: to } });
+    });
+    res.json(updated);
   });
-  res.json(updated);
-});
+}
+
+// PATCH /api/quotes/:id/shortlist  (buyer)
+const shortlistQuote = changeQuoteStatus('SHORTLISTED', ['SUBMITTED']);
 
 // PATCH /api/quotes/:id/reject  (buyer)
-const rejectQuote = asyncHandler(async (req, res) => {
-  const quote = await prisma.quote.findUnique({ where: { id: req.params.id }, include: { rfq: true } });
-  if (!quote) return res.status(404).json({ error: 'Quote not found' });
-  if (quote.rfq.buyerCompanyId !== req.user.companyId) return res.status(403).json({ error: 'Forbidden' });
-
-  const updated = await prisma.quote.update({
-    where: { id: req.params.id },
-    data: { status: 'REJECTED' },
-  });
-  res.json(updated);
-});
+const rejectQuote = changeQuoteStatus('REJECTED', ['SUBMITTED', 'SHORTLISTED']);
 
 module.exports = { submitQuote, listQuotesForRFQ, shortlistQuote, rejectQuote };

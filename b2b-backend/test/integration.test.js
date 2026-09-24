@@ -670,6 +670,77 @@ async function newRfq(budget = 500, extra = {}) {
   try { await db.$executeRawUnsafe(`UPDATE "Quote" SET currency = 'USD' WHERE id = '${r.data.id}'`); } catch (e) { checkRejects = /Quote_currency_bhd_check/.test(e.message); }
   check('database itself refuses a non-BHD currency (CHECK constraint)', checkRejects);
 
+  console.log('\n== 18c. M7 shortlist/reject respect quote and RFQ status ==');
+  await db.wallet.updateMany({ where: { companyId: { in: ['sup1', 'sup2', 'sup3'] } }, data: { balance: 100 } });
+  const sl = (id, tokn = B1) => call('PATCH', `/quotes/${id}/shortlist`, tokn);
+  const rj = (id, tokn = B1) => call('PATCH', `/quotes/${id}/reject`, tokn);
+  const qStatus = async (id) => (await db.quote.findUnique({ where: { id } })).status;
+  const threeQuotes = async () => {
+    const rf = await newRfq(100);
+    for (const [s, price] of [[S1, 50], [S2, 60], [S3, 70]]) await call('POST', `/rfqs/${rf.id}/quotes`, s, { price });
+    const qs = await db.quote.findMany({ where: { rfqId: rf.id }, orderBy: { price: 'asc' } });
+    return { rfq: rf, q1: qs[0].id, q2: qs[1].id, q3: qs[2].id };
+  };
+
+  // PUBLISHED RFQ: normal transitions
+  let m7 = await threeQuotes();
+  r = await sl(m7.q1);
+  check('shortlist SUBMITTED on PUBLISHED RFQ -> 200 SHORTLISTED', r.status === 200 && r.data.status === 'SHORTLISTED', r.data);
+  check('shortlist again -> 200, unchanged (idempotent)', (await sl(m7.q1)).status === 200 && (await qStatus(m7.q1)) === 'SHORTLISTED');
+  check('reject SUBMITTED -> 200 REJECTED', (await rj(m7.q2)).status === 200 && (await qStatus(m7.q2)) === 'REJECTED');
+  check('reject again -> 200, unchanged (idempotent)', (await rj(m7.q2)).status === 200 && (await qStatus(m7.q2)) === 'REJECTED');
+  r = await sl(m7.q2);
+  check('shortlist a REJECTED quote -> 400', r.status === 400 && /REJECTED quote/.test(r.data.error) && (await qStatus(m7.q2)) === 'REJECTED', r.data);
+  check('reject a SHORTLISTED quote -> 200', (await rj(m7.q1)).status === 200 && (await qStatus(m7.q1)) === 'REJECTED');
+  await db.quote.update({ where: { id: m7.q3 }, data: { status: 'WITHDRAWN' } });
+  check('shortlist a WITHDRAWN quote -> 400', (await sl(m7.q3)).status === 400 && (await qStatus(m7.q3)) === 'WITHDRAWN');
+  check('reject a WITHDRAWN quote -> 400', (await rj(m7.q3)).status === 400 && (await qStatus(m7.q3)) === 'WITHDRAWN');
+  check('other buyer -> 403', (await sl(m7.q1, B2)).status === 403 && (await rj(m7.q1, B2)).status === 403);
+  check('supplier (own quote) -> 403', (await sl(m7.q1, S1)).status === 403 && (await rj(m7.q1, S1)).status === 403);
+  check('unknown quote -> 404', (await sl('00000000-0000-0000-0000-000000000000')).status === 404);
+
+  // AWARDED quote / AWARDED RFQ: nothing can be changed any more
+  m7 = await threeQuotes();
+  await sl(m7.q2);
+  check('award q1 -> 201', (await call('POST', `/quotes/${m7.q1}/award`, B1, {})).status === 201);
+  r = await rj(m7.q1);
+  check('reject the AWARDED quote -> 400, stays AWARDED', r.status === 400 && (await qStatus(m7.q1)) === 'AWARDED', r.data);
+  check('shortlist the AWARDED quote -> 400, stays AWARDED', (await sl(m7.q1)).status === 400 && (await qStatus(m7.q1)) === 'AWARDED');
+  check('LPO of the awarded quote untouched', (await db.lPO.findFirst({ where: { quoteId: m7.q1 } })).status === 'ISSUED');
+  await db.quote.update({ where: { id: m7.q2 }, data: { status: 'SUBMITTED' } }); // even a still-open quote...
+  r = await sl(m7.q2);
+  check('...on an AWARDED RFQ cannot be shortlisted -> 400 (RFQ status)', r.status === 400 && /RFQ in AWARDED/.test(r.data.error), r.data);
+  check('...nor rejected -> 400', (await rj(m7.q2)).status === 400 && (await qStatus(m7.q2)) === 'SUBMITTED');
+
+  // CANCELLED RFQ
+  m7 = await threeQuotes();
+  check('cancel RFQ -> 200', (await call('POST', `/rfqs/${m7.rfq.id}/cancel`, B1)).status === 200);
+  await db.quote.update({ where: { id: m7.q1 }, data: { status: 'SUBMITTED' } }); // isolate the RFQ-status check
+  r = await sl(m7.q1);
+  check('shortlist on a CANCELLED RFQ -> 400', r.status === 400 && /RFQ in CANCELLED/.test(r.data.error), r.data);
+  check('reject on a CANCELLED RFQ -> 400', (await rj(m7.q1)).status === 400 && (await qStatus(m7.q1)) === 'SUBMITTED');
+
+  // QUOTING_CLOSED: bidding closed, buyer still evaluating -> allowed
+  m7 = await threeQuotes();
+  check('close quoting -> 200', (await call('PATCH', `/rfqs/${m7.rfq.id}`, B1, { status: 'QUOTING_CLOSED' })).status === 200);
+  check('shortlist on QUOTING_CLOSED -> 200', (await sl(m7.q1)).status === 200 && (await qStatus(m7.q1)) === 'SHORTLISTED');
+  check('reject on QUOTING_CLOSED -> 200', (await rj(m7.q2)).status === 200 && (await qStatus(m7.q2)) === 'REJECTED');
+
+  // award and reject of the same quote at the same time: exactly one wins, state stays consistent
+  // alternate which request is sent first, so both outcomes get exercised
+  const raceOutcomes = [];
+  for (let round = 1; round <= 6; round++) {
+    m7 = await threeQuotes();
+    const award = () => call('POST', `/quotes/${m7.q1}/award`, B1, {});
+    const [aw, rjr] = round % 2 ? await Promise.all([award(), rj(m7.q1)]) : (await Promise.all([rj(m7.q1), award()])).reverse();
+    const st1 = await qStatus(m7.q1);
+    const lpo = await db.lPO.findFirst({ where: { quoteId: m7.q1 } });
+    const consistent = (aw.status === 201 && rjr.status === 400 && st1 === 'AWARDED' && !!lpo) || (aw.status === 400 && rjr.status === 200 && st1 === 'REJECTED' && !lpo);
+    raceOutcomes.push(st1);
+    check(`award vs reject race (round ${round}): exactly one wins, consistent`, consistent, { award: aw.status, reject: rjr.status, quote: st1, lpo: !!lpo });
+  }
+  console.log('race winners:', raceOutcomes.join(', '));
+
   console.log('\n== 19. L1 errors -> 4xx ==');
   r = await call('GET', '/rfqs?status=FOO', B1);
   check('invalid RFQ status filter -> 400', r.status === 400 && /status must be one of/.test(r.data.error), r.data);
