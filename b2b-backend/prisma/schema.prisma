@@ -216,6 +216,7 @@ model Quote {
   updatedAt          DateTime    @updatedAt
 
   lpo LPO?
+  attachments QuoteAttachment[]
 
   // one quote per supplier per RFQ (also enforced in submitQuote; this is the DB-level guarantee)
   @@unique([rfqId, supplierCompanyId])
@@ -359,7 +360,9 @@ model Notification {
 
 // A file attached to an order: delivery note, invoice or other document. The file itself is in the private
 // storage bucket under storageKey (never overwritten); only the order's parties and admins can get it.
-// kind: DELIVERY_NOTE | INVOICE | OTHER (CHECK constraint in the migration, like Quote.currency).
+// kind: DELIVERY_NOTE | INVOICE | OTHER | QUOTE_ATTACHMENT (CHECK constraint in the migrations, like Quote.currency).
+// QUOTE_ATTACHMENT rows are the winning bid's attachments, added when the LPO is accepted; they point at the
+// attachment's stored object (objects are never overwritten or deleted), so storageKey isn't unique here.
 model OrderDocument {
   id                  String    @id @default(uuid())
   orderId             String
@@ -369,7 +372,7 @@ model OrderDocument {
   fileName            String
   contentType         String
   sizeBytes           Int
-  storageKey          String    @unique
+  storageKey          String
   uploadedByCompanyId String
   uploadedByCompany   Company   @relation(fields: [uploadedByCompanyId], references: [id])
   createdAt           DateTime  @default(now())
@@ -378,4 +381,25 @@ model OrderDocument {
 
   // documents panel: WHERE orderId AND deletedAt IS NULL ORDER BY createdAt
   @@index([orderId, createdAt])
+  @@index([storageKey])
+}
+
+// A file a supplier attaches to its quote (up to 5, 10 MB each). The file is in the private storage bucket;
+// only the supplier, the RFQ's buyer and admins can see it — other suppliers learn nothing, not even the count.
+// Editable only while the quote is SUBMITTED and the RFQ open for quotes; frozen after that.
+model QuoteAttachment {
+  id          String    @id @default(uuid())
+  quoteId     String
+  quote       Quote     @relation(fields: [quoteId], references: [id])
+  // original name, shown in the list and used for the download
+  fileName    String
+  contentType String
+  sizeBytes   Int
+  storageKey  String    @unique
+  createdAt   DateTime  @default(now())
+  // soft delete: hidden from the list, the stored file is kept
+  deletedAt   DateTime?
+
+  // WHERE quoteId AND deletedAt IS NULL ORDER BY createdAt
+  @@index([quoteId, createdAt])
 }

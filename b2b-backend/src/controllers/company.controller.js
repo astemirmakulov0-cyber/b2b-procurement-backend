@@ -164,6 +164,8 @@ const deleteCompany = asyncHandler(async (req, res) => {
 
     // No shared trading history: remove everything that belongs to this company only
     const ownRfqIds = (await tx.rFQ.findMany({ where: { buyerCompanyId: id }, select: { id: true } })).map((r) => r.id);
+    // attachment rows go with their quotes (the stored files stay in the bucket, unreferenced)
+    await tx.quoteAttachment.deleteMany({ where: { quote: { OR: [{ supplierCompanyId: id }, { rfqId: { in: ownRfqIds } }] } } });
     await tx.quote.deleteMany({ where: { OR: [{ supplierCompanyId: id }, { rfqId: { in: ownRfqIds } }] } });
     await tx.rFQ.deleteMany({ where: { buyerCompanyId: id } });
     const wallet = await tx.wallet.findUnique({ where: { companyId: id } });

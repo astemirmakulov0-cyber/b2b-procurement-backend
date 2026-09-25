@@ -4,12 +4,12 @@ const prisma = require('../config/prisma');
 const asyncHandler = require('../utils/asyncHandler');
 const { notify } = require('../utils/notify');
 const storage = require('../utils/storage');
-const { readSingleFile, sniffType, cleanFileName } = require('../utils/upload');
+const { readSingleFile, sniffType, storedFileName } = require('../utils/upload');
 
-// Who may upload each kind: the supplier issues delivery notes and invoices; either party adds other files
+// Who may upload each kind: the supplier issues delivery notes and invoices; either party adds other files.
+// QUOTE_ATTACHMENT documents aren't uploaded here: they are the winning bid's attachments, added on LPO acceptance.
 const KIND_UPLOADERS = { DELIVERY_NOTE: ['supplier'], INVOICE: ['supplier'], OTHER: ['buyer', 'supplier'] };
-const KIND_LABELS = { DELIVERY_NOTE: 'delivery note', INVOICE: 'invoice', OTHER: 'document' };
-const EXTENSIONS = { 'application/pdf': ['.pdf'], 'image/png': ['.png'], 'image/jpeg': ['.jpg', '.jpeg'], 'image/webp': ['.webp'] };
+const KIND_LABELS = { DELIVERY_NOTE: 'delivery note', INVOICE: 'invoice', OTHER: 'document', QUOTE_ATTACHMENT: 'bid attachment' };
 const MAX_DOCUMENTS_PER_ORDER = 50;
 // documents can still be removed while the order is open; a finished order's records stay as they are
 const CLOSED_ORDER_STATUSES = ['COMPLETED', 'CANCELLED'];
@@ -60,9 +60,7 @@ const uploadOrderDocument = asyncHandler(async (req, res) => {
   const contentType = sniffType(file.buffer);
   if (!contentType) return res.status(415).json({ error: 'Only PDF, JPEG, PNG or WebP files are accepted' });
 
-  // keep the original name, with an extension that matches the real content
-  let fileName = cleanFileName(file.fileName);
-  if (!EXTENSIONS[contentType].some((ext) => fileName.toLowerCase().endsWith(ext))) fileName = fileName.slice(0, 195) + EXTENSIONS[contentType][0];
+  const fileName = storedFileName(file.fileName, contentType);
 
   const storageKey = storage.newKey(`orders/${order.id}`);
   try {
@@ -108,6 +106,7 @@ const deleteDocument = asyncHandler(async (req, res) => {
   const { doc, order, error } = await documentAccess(req.params.id, req.user);
   if (error) return res.status(error[0]).json({ error: error[1] });
   if (doc.uploadedByCompanyId !== req.user.companyId) return res.status(403).json({ error: 'Only the company that added a document can remove it' });
+  if (doc.kind === 'QUOTE_ATTACHMENT') return res.status(400).json({ error: 'Bid attachments are part of the accepted quote and cannot be removed' });
   if (CLOSED_ORDER_STATUSES.includes(order.status)) return res.status(400).json({ error: `Documents of a ${order.status} order cannot be removed` });
   const { count } = await prisma.orderDocument.updateMany({ where: { id: doc.id, deletedAt: null }, data: { deletedAt: new Date() } });
   if (count === 0) return res.status(404).json({ error: 'Document not found' });

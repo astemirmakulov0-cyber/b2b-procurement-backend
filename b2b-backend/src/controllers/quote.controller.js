@@ -2,6 +2,7 @@ const prisma = require('../config/prisma');
 const asyncHandler = require('../utils/asyncHandler');
 const { notify } = require('../utils/notify');
 const { MONEY_DECIMALS, parseAmount, formatAmount } = require('../utils/money');
+const { ATTACHMENT_SELECT } = require('./quoteAttachment.controller');
 
 const BID_FEE_PERCENT = 0.05; // supplier pays 5% of the RFQ's budget to submit a quote
 
@@ -90,7 +91,11 @@ const listQuotesForRFQ = asyncHandler(async (req, res) => {
 
   const quotes = await prisma.quote.findMany({
     where,
-    include: { supplierCompany: { select: { id: true, name: true, verificationStatus: true } } },
+    include: {
+      supplierCompany: { select: { id: true, name: true, verificationStatus: true } },
+      // live attachments (a supplier only ever gets its own quote here)
+      attachments: { where: { deletedAt: null }, select: ATTACHMENT_SELECT, orderBy: { createdAt: 'asc' } },
+    },
     orderBy: { price: 'asc' },
   });
   res.json(quotes);
