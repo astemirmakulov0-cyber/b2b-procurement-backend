@@ -315,6 +315,9 @@ async function newRfq(budget = 500, extra = {}) {
   check('delivery backwards DELIVERED -> DISPATCHED -> 400', (await call('PATCH', `/orders/${order1.id}/delivery`, S2, { status: 'DISPATCHED' })).status === 400);
   const inv1 = await db.invoice.findUnique({ where: { orderId: order1.id } });
   r = await call('POST', `/invoices/${inv1.id}/payments`, B1, { amount: Number(inv1.amount), method: 'bank_transfer' });
+  check('payment before receipt -> 400', r.status === 400 && /confirm receipt/.test(r.data.error), r.data);
+  check('buyer confirms receipt -> 200, order stays DELIVERED', (await call('POST', `/orders/${order1.id}/receipt`, B1, {})).status === 200 && (await ordStatus()) === 'DELIVERED');
+  r = await call('POST', `/invoices/${inv1.id}/payments`, B1, { amount: Number(inv1.amount), method: 'bank_transfer' });
   check('full payment reported -> 201 PENDING, order not completed yet', r.status === 201 && r.data.payment.status === 'PENDING' && (await ordStatus()) === 'DELIVERED', r.data);
   check('supplier confirms -> order COMPLETED', (await call('PATCH', `/payments/${r.data.payment.id}/confirm`, S2, {})).status === 200 && (await ordStatus()) === 'COMPLETED');
   check('supplier cannot cancel COMPLETED -> 400', (await st(S2, 'CANCELLED')).status === 400);
@@ -327,8 +330,9 @@ async function newRfq(budget = 500, extra = {}) {
   }
 
   console.log('\n== 11. C6/M10/M14 payments: report -> supplier confirms/rejects ==');
-  // helper: RFQ -> quote by sup -> award -> accept, returns { order, invoice }
-  async function makeOrder(price, supTok, supId, buyerTok = B1) {
+  // helper: RFQ -> quote by sup -> award -> accept, returns { order, invoice };
+  // received: also dispatch and confirm receipt, so the invoice is payable
+  async function makeOrder(price, supTok, supId, buyerTok = B1, { received = false } = {}) {
     await db.wallet.update({ where: { companyId: supId }, data: { balance: 1000 } });
     const rf = (await call('POST', '/rfqs', buyerTok, { title: 'Pay ' + price, description: 'x', budget: 100, deadline: future(), publish: true })).data;
     await call('POST', `/rfqs/${rf.id}/quotes`, supTok, { price });
@@ -336,9 +340,17 @@ async function newRfq(budget = 500, extra = {}) {
     await call('POST', `/quotes/${q.id}/award`, buyerTok, {});
     const l = await db.lPO.findFirst({ where: { rfqId: rf.id } });
     const acc = await call('PATCH', `/lpos/${l.id}/accept`, supTok);
+    if (received) {
+      await call('PATCH', `/orders/${acc.data.order.id}/delivery`, supTok, { status: 'DISPATCHED' });
+      const rc = await call('POST', `/orders/${acc.data.order.id}/receipt`, buyerTok, {});
+      if (rc.status !== 200) throw new Error('makeOrder: receipt failed ' + JSON.stringify(rc.data));
+    }
     return { order: acc.data.order, invoice: await db.invoice.findUnique({ where: { orderId: acc.data.order.id } }), rfq: rf };
   }
-  const { order: po, invoice: pinv } = await makeOrder(100, S2, 'sup2');
+  // payments reported before receipt was required (data from before that rule): created directly
+  const legacyPayment = (invoiceId, amount, status = 'PENDING') => db.payment.create({ data: { invoiceId, amount, method: 'cash', status,
+    ...(status === 'COMPLETED' ? { decidedAt: new Date(), paidAt: new Date() } : {}) } });
+  const { order: po, invoice: pinv } = await makeOrder(100, S2, 'sup2', B1, { received: true });
   const pay = (body, tokn = B1) => call('POST', `/invoices/${pinv.id}/payments`, tokn, body);
   const invNow = async () => db.invoice.findUnique({ where: { id: pinv.id } });
   const poStatus = async () => (await db.order.findUnique({ where: { id: po.id } })).status;
@@ -365,7 +377,7 @@ async function newRfq(budget = 500, extra = {}) {
   check('confirm a rejected payment -> 400', (await call('PATCH', `/payments/${p60.id}/confirm`, S2, {})).status === 400);
   check('buyer notified of rejection', (await db.notification.count({ where: { companyId: 'buyer1', type: 'PAYMENT_REJECTED', body: { contains: 'Cheque bounced' } } })) === 1);
   r = await call('PATCH', `/payments/${p40.id}/confirm`, S2, {});
-  check('confirm 40 -> invoice PARTIALLY_PAID, order not completed', r.status === 200 && r.data.invoice.status === 'PARTIALLY_PAID' && (await poStatus()) === 'CONFIRMED', r.data.invoice);
+  check('confirm 40 -> invoice PARTIALLY_PAID, order not completed', r.status === 200 && r.data.invoice.status === 'PARTIALLY_PAID' && (await poStatus()) === 'DELIVERED', r.data.invoice);
 
   // M10: three parallel reports of 30 with 60 outstanding -> exactly two accepted
   const par = await Promise.all([1, 2, 3].map(() => pay({ amount: 30, method: 'cash' })));
@@ -380,17 +392,17 @@ async function newRfq(budget = 500, extra = {}) {
   r = await pay({ amount: 1, method: 'cash' });
   check('pay a PAID invoice -> 400', r.status === 400 && /already paid/.test(r.data.error), r.data);
 
-  // order cancelled with a pending payment -> payment FAILED, invoice CANCELLED, no more payments
+  // order cancelled with a (pre-rule) pending payment -> payment FAILED, invoice CANCELLED, no more payments
   const { order: co, invoice: cinv } = await makeOrder(50, S2, 'sup2');
-  const pp = (await call('POST', `/invoices/${cinv.id}/payments`, B1, { amount: 20, method: 'cash' })).data.payment;
+  const pp = await legacyPayment(cinv.id, 20);
   check('supplier cancels order with only a pending payment -> 200', (await call('PATCH', `/orders/${co.id}/status`, S2, { status: 'CANCELLED' })).status === 200);
   const ppAfter = await db.payment.findUnique({ where: { id: pp.id } });
   check('pending payment -> FAILED "Order cancelled", invoice CANCELLED', ppAfter.status === 'FAILED' && ppAfter.rejectReason === 'Order cancelled' && (await db.invoice.findUnique({ where: { id: cinv.id } })).status === 'CANCELLED');
   check('pay a CANCELLED invoice -> 400', (await call('POST', `/invoices/${cinv.id}/payments`, B1, { amount: 5, method: 'cash' })).status === 400);
   check('confirm payment of cancelled invoice -> 400', (await call('PATCH', `/payments/${pp.id}/confirm`, S2, {})).status === 400);
   const { order: ko, invoice: kinv } = await makeOrder(50, S2, 'sup2');
-  const kp = (await call('POST', `/invoices/${kinv.id}/payments`, B1, { amount: 10, method: 'cash' })).data.payment;
-  await call('PATCH', `/payments/${kp.id}/confirm`, S2, {});
+  const kp = await legacyPayment(kinv.id, 10);
+  check('supplier can still confirm a payment reported before receipt -> 200', (await call('PATCH', `/payments/${kp.id}/confirm`, S2, {})).status === 200);
   check('supplier cannot cancel order with a confirmed payment -> 400', (await call('PATCH', `/orders/${ko.id}/status`, S2, { status: 'CANCELLED' })).status === 400);
 
   console.log('\n== 12. BHD fils: 3 decimals everywhere ==');
@@ -416,7 +428,7 @@ async function newRfq(budget = 500, extra = {}) {
   r = await call('POST', `/rfqs/${fq.id}/quotes`, S2, { price: 1.0005 });
   check('quote price with 4 decimals -> 400, no fee charged', r.status === 400 && /3 decimal/.test(r.data.error));
   check('admin top-up 0.005 (5 fils) -> 201', (await call('POST', '/wallet/topup', ADM, { companyId: 'sup3', amount: 0.005 })).status === 201);
-  const { invoice: finv } = await makeOrder(12.345, S2, 'sup2');
+  const { invoice: finv } = await makeOrder(12.345, S2, 'sup2', B1, { received: true });
   check('invoice amount 12.345 kept to the fils', finv.amount.toString() === '12.345');
   r = await call('POST', `/invoices/${finv.id}/payments`, B1, { amount: 12.346, method: 'benefit_pay' });
   check('1 fils over the outstanding -> 400 (outstanding 12.345)', r.status === 400 && /12\.345/.test(r.data.error), r.data);
@@ -430,7 +442,7 @@ async function newRfq(budget = 500, extra = {}) {
     company: { create: { id, name: 'Co ' + id, type: role, verificationStatus: 'VERIFIED', phone: '+973 1', registrationNumber: 'CR-' + id, wallet: { create: { balance } } } } } });
   await mkCo('buyer5', 'BUYER'); await mkCo('sup5', 'SUPPLIER', 1000);
   const B5 = tok('BUYER', 'buyer5'), S5 = tok('SUPPLIER', 'sup5');
-  const { order: o5, invoice: i5 } = await makeOrder(80, S5, 'sup5', B5);
+  const { order: o5, invoice: i5 } = await makeOrder(80, S5, 'sup5', B5, { received: true });
   const p5 = (await call('POST', `/invoices/${i5.id}/payments`, B5, { amount: 80, method: 'bank_transfer' })).data.payment;
   await call('PATCH', `/payments/${p5.id}/confirm`, S5, {});
   await db.wallet.update({ where: { companyId: 'sup1' }, data: { balance: 100 } });
@@ -831,17 +843,19 @@ async function newRfq(budget = 500, extra = {}) {
   check('...no chat message written', (await db.message.count({ where: { orderId: dd.order.id } })) === 0);
   r = await call('GET', '/admin/orders?status=DISPUTED', ADM);
   check('...admin list shows reason null', r.data.find((x) => x.id === dd.order.id).disputeReason === null);
-  // invoice fully paid during the dispute -> RESUME completes the order, as the payment would have
+  // a pre-rule payment fully paying the invoice during the dispute: order stays DISPUTED; RESUME goes back
+  // to the pre-dispute status (not COMPLETED — the goods aren't received); receipt then completes it
   const inv = await db.invoice.findUnique({ where: { orderId: dd.order.id } });
-  r = await call('POST', `/invoices/${inv.id}/payments`, B1, { amount: Number(inv.amount), method: 'bank_transfer' });
-  await call('PATCH', `/payments/${r.data.payment.id}/confirm`, S2, {});
+  const lp = await legacyPayment(inv.id, inv.amount);
+  await call('PATCH', `/payments/${lp.id}/confirm`, S2, {});
   check('payment confirmed during dispute keeps the order DISPUTED', (await ordOf(dd.order.id)).status === 'DISPUTED' && (await db.invoice.findUnique({ where: { id: inv.id } })).status === 'PAID');
-  check('RESUME of a paid order -> COMPLETED', (await resolve(dd.order.id, { action: 'RESUME', comment: 'Paid, closing' })).status === 200 && (await ordOf(dd.order.id)).status === 'COMPLETED');
+  check('RESUME of a paid, not received order -> back to CONFIRMED, not COMPLETED', (await resolve(dd.order.id, { action: 'RESUME', comment: 'Paid, go on' })).status === 200 && (await ordOf(dd.order.id)).status === 'CONFIRMED');
+  await call('PATCH', `/orders/${dd.order.id}/delivery`, S2, { status: 'DISPATCHED' });
+  check('...receipt of the paid order -> COMPLETED', (await call('POST', `/orders/${dd.order.id}/receipt`, B1, {})).status === 200 && (await ordOf(dd.order.id)).status === 'COMPLETED');
 
-  // CANCEL: pending payment fails, invoice without confirmed money is cancelled
+  // CANCEL: (pre-rule) pending payment fails, invoice without confirmed money is cancelled
   dd = await makeOrder(60, S2, 'sup2');
-  r = await call('POST', `/invoices/${dd.invoice.id}/payments`, B1, { amount: 10, method: 'cash' });
-  const pendingId = r.data.payment.id;
+  const pendingId = (await legacyPayment(dd.invoice.id, 10)).id;
   await dispute(dd.order.id, { reason: 'Never delivered' });
   r = await resolve(dd.order.id, { action: 'CANCEL', comment: 'Supplier did not deliver' });
   check('CANCEL -> 200, order CANCELLED', r.status === 200 && (await ordOf(dd.order.id)).status === 'CANCELLED');
@@ -853,8 +867,7 @@ async function newRfq(budget = 500, extra = {}) {
 
   // CANCEL keeps an invoice that has confirmed money on it
   dd = await makeOrder(60, S2, 'sup2');
-  r = await call('POST', `/invoices/${dd.invoice.id}/payments`, B1, { amount: 20, method: 'cash' });
-  await call('PATCH', `/payments/${r.data.payment.id}/confirm`, S2, {});
+  await call('PATCH', `/payments/${(await legacyPayment(dd.invoice.id, 20)).id}/confirm`, S2, {});
   await dispute(dd.order.id, {});
   check('CANCEL with confirmed money -> invoice kept PARTIALLY_PAID', (await resolve(dd.order.id, { action: 'CANCEL', comment: 'Refund off-platform' })).status === 200 &&
     (await db.invoice.findUnique({ where: { id: dd.invoice.id } })).status === 'PARTIALLY_PAID');
@@ -876,6 +889,76 @@ async function newRfq(budget = 500, extra = {}) {
     check(`resume vs cancel race (round ${round}): one 200 + one 400, one admin comment`,
       [a1.status, a2.status].sort().join() === '200,400' && adminMsgs === 1 && (a1.status === 200 ? o.status === 'CONFIRMED' : o.status === 'CANCELLED'),
       { resume: a1.status, cancel: a2.status, order: o.status, adminMsgs });
+  }
+
+  console.log('\n== 18c4. receipt confirmation: acceptance before invoice and payment ==');
+  const receipt = (id, body = {}, tokn = B1) => call('POST', `/orders/${id}/receipt`, tokn, body);
+  const RECEIPT_MSG = 'Receipt confirmed: all goods received in the agreed quantity and quality.';
+  let ro = await makeOrder(70, S2, 'sup2');
+  const rinv = await db.invoice.findUnique({ where: { orderId: ro.order.id } });
+  r = await receipt(ro.order.id);
+  check('receipt before shipment -> 400, nothing recorded', r.status === 400 && /once the order is shipped/.test(r.data.error) && (await ordOf(ro.order.id)).receivedAt === null, r.data);
+  check('payment before receipt -> 400', (await call('POST', `/invoices/${rinv.id}/payments`, B1, { amount: 10, method: 'cash' })).status === 400);
+  await call('PATCH', `/orders/${ro.order.id}/delivery`, S2, { status: 'DISPATCHED', trackingInfo: 'TRK-R1' });
+  check('supplier cannot confirm receipt -> 403', (await receipt(ro.order.id, {}, S2)).status === 403);
+  check('other buyer -> 403', (await receipt(ro.order.id, {}, B2)).status === 403);
+  check('unknown order -> 404', (await receipt('00000000-0000-0000-0000-000000000000')).status === 404);
+  check('comment over 1000 chars -> 400', (await receipt(ro.order.id, { comment: 'x'.repeat(1001) })).status === 400 && (await ordOf(ro.order.id)).receivedAt === null);
+  const before = Date.now();
+  r = await receipt(ro.order.id, { comment: '  Counted and checked  ' });
+  o = await ordOf(ro.order.id);
+  const rdel = await db.delivery.findUnique({ where: { orderId: ro.order.id } });
+  const rinvAfter = await db.invoice.findUnique({ where: { id: rinv.id } });
+  check('receipt on SHIPPED -> 200, receivedAt set, order DELIVERED', r.status === 200 && o.status === 'DELIVERED' && o.receivedAt && o.receivedAt.getTime() >= before - 1000, o);
+  check('...delivery marked DELIVERED with deliveredAt', rdel.status === 'DELIVERED' && !!rdel.deliveredAt);
+  check('...invoice issuedAt = receipt time', rinvAfter.issuedAt.getTime() === o.receivedAt.getTime() && rinvAfter.status === 'ISSUED');
+  msgs = await db.message.findMany({ where: { orderId: ro.order.id } });
+  check('...chat message by the buyer with the note', msgs.length === 1 && msgs[0].senderCompanyId === 'buyer1' && msgs[0].body === RECEIPT_MSG + ' Note: Counted and checked', msgs);
+  await settle();
+  const rnote = (await notesOf('sup2', 'RECEIPT_CONFIRMED', ro.order.id))[0];
+  check('...supplier notified', !!rnote && /confirmed receipt of "Pay 70"/.test(rnote.body) && /Counted and checked/.test(rnote.body), rnote);
+  check('receipt again -> 400', (await receipt(ro.order.id)).status === 400 && (await db.message.count({ where: { orderId: ro.order.id } })) === 1);
+  r = await dispute(ro.order.id, { reason: 'too late' });
+  check('dispute after receipt -> 400, order stays DELIVERED', r.status === 400 && /no longer be disputed/.test(r.data.error) && (await ordOf(ro.order.id)).status === 'DELIVERED', r.data);
+  r = await call('POST', `/invoices/${rinv.id}/payments`, B1, { amount: 70, method: 'bank_transfer' });
+  check('payment after receipt -> 201', r.status === 201, r.data);
+  check('...confirmed -> order COMPLETED', (await call('PATCH', `/payments/${r.data.payment.id}/confirm`, S2, {})).status === 200 && (await ordOf(ro.order.id)).status === 'COMPLETED');
+
+  // supplier already marked delivered: receipt keeps the delivery time; no comment -> plain message
+  ro = await makeOrder(30, S2, 'sup2');
+  await call('PATCH', `/orders/${ro.order.id}/delivery`, S2, { status: 'DISPATCHED' });
+  await call('PATCH', `/orders/${ro.order.id}/delivery`, S2, { status: 'DELIVERED' });
+  const deliveredAt = (await db.delivery.findUnique({ where: { orderId: ro.order.id } })).deliveredAt;
+  check('receipt on DELIVERED -> 200', (await receipt(ro.order.id)).status === 200 && (await ordOf(ro.order.id)).status === 'DELIVERED');
+  check('...supplier delivery time kept', (await db.delivery.findUnique({ where: { orderId: ro.order.id } })).deliveredAt.getTime() === deliveredAt.getTime());
+  check('...message without note', (await db.message.findFirst({ where: { orderId: ro.order.id } })).body === RECEIPT_MSG);
+
+  // disputed order: no receipt until the admin resumes it
+  ro = await makeOrder(30, S2, 'sup2');
+  await call('PATCH', `/orders/${ro.order.id}/delivery`, S2, { status: 'DISPATCHED' });
+  await dispute(ro.order.id, { reason: 'Wrong items' });
+  check('receipt on DISPUTED -> 400', (await receipt(ro.order.id)).status === 400 && (await ordOf(ro.order.id)).receivedAt === null);
+  await resolve(ro.order.id, { action: 'RESUME', comment: 'Correct items sent' });
+  check('...after RESUME (SHIPPED) receipt -> 200', (await receipt(ro.order.id)).status === 200);
+
+  // pre-rule payment fully paid before receipt: order not completed until receipt
+  ro = await makeOrder(25, S2, 'sup2');
+  const lp2 = await legacyPayment(ro.invoice.id, 25);
+  await call('PATCH', `/payments/${lp2.id}/confirm`, S2, {});
+  check('full payment before receipt -> invoice PAID, order NOT completed', (await db.invoice.findUnique({ where: { id: ro.invoice.id } })).status === 'PAID' && (await ordOf(ro.order.id)).status === 'CONFIRMED');
+  await call('PATCH', `/orders/${ro.order.id}/delivery`, S2, { status: 'DISPATCHED' });
+  check('...buyer can still dispute it before receipt', (await dispute(ro.order.id, {})).status === 200);
+  await resolve(ro.order.id, { action: 'RESUME', comment: 'ok' });
+  check('...receipt of the paid order -> COMPLETED', (await receipt(ro.order.id)).status === 200 && (await ordOf(ro.order.id)).status === 'COMPLETED');
+
+  // receipt and dispute at the same time: exactly one wins
+  for (let round = 1; round <= 4; round++) {
+    ro = await makeOrder(15, S2, 'sup2');
+    await call('PATCH', `/orders/${ro.order.id}/delivery`, S2, { status: 'DISPATCHED' });
+    const [rc, dp] = round % 2 ? await Promise.all([receipt(ro.order.id), dispute(ro.order.id, { reason: 'r' })]) : (await Promise.all([dispute(ro.order.id, { reason: 'r' }), receipt(ro.order.id)])).reverse();
+    o = await ordOf(ro.order.id);
+    const ok = (rc.status === 200 && dp.status >= 400 && o.status === 'DELIVERED' && !!o.receivedAt) || (rc.status === 400 && dp.status === 200 && o.status === 'DISPUTED' && !o.receivedAt);
+    check(`receipt vs dispute race (round ${round}): exactly one wins, consistent`, ok, { receipt: rc.status, dispute: dp.status, order: o.status, receivedAt: !!o.receivedAt });
   }
 
   console.log('\n== 18d. L6 change-password attempts limited per user ==');

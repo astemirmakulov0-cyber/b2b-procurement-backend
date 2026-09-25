@@ -16,6 +16,7 @@ router.get('/orders', authRequired, orderCtrl.listOrders);
 router.get('/orders/:id', authRequired, orderCtrl.getOrder);
 router.patch('/orders/:id/status', authRequired, orderCtrl.updateOrderStatus);
 router.patch('/orders/:id/delivery', authRequired, requireRole('SUPPLIER'), orderCtrl.updateDelivery);
+router.post('/orders/:id/receipt', authRequired, requireRole('BUYER'), orderCtrl.confirmReceipt);
 
 // Admin: disputes
 router.get('/admin/orders', authRequired, requireRole('ADMIN'), orderCtrl.listOrdersAdmin);

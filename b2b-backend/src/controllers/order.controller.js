@@ -6,7 +6,9 @@ async function loadOrderWithAccessCheck(orderId, user) {
   const order = await prisma.order.findUnique({
     where: { id: orderId },
     include: {
-      lpo: { include: { buyerCompany: { select: { id: true, name: true } }, supplierCompany: { select: { id: true, name: true } } } },
+      lpo: { include: {
+        buyerCompany: { select: { id: true, name: true } }, supplierCompany: { select: { id: true, name: true } }, rfq: { select: { title: true } },
+      } },
       delivery: true, invoice: { include: { payments: true } },
     },
   });
@@ -53,7 +55,8 @@ const SUPPLIER_TRANSITIONS = {
   IN_PROGRESS: ['SHIPPED', 'CANCELLED'],
   SHIPPED: ['DELIVERED'],
 };
-// the buyer can only raise a dispute, while the order is still open
+// the buyer can only raise a dispute, while the order is still open and the goods not yet accepted
+// (receipt is confirmed via POST /api/orders/:id/receipt, which closes disputes)
 const BUYER_TRANSITIONS = {
   CONFIRMED: ['DISPUTED'], IN_PROGRESS: ['DISPUTED'], SHIPPED: ['DISPUTED'], DELIVERED: ['DISPUTED'],
 };
@@ -95,6 +98,9 @@ const updateOrderStatus = asyncHandler(async (req, res) => {
   if (!(table[order.status] || []).includes(status)) {
     return res.status(400).json({ error: `Cannot change order status from ${order.status} to ${status}` });
   }
+  if (status === 'DISPUTED' && order.receivedAt) {
+    return res.status(400).json({ error: 'Receipt was confirmed: the order can no longer be disputed' });
+  }
   if (status === 'CANCELLED' && isSupplier) {
     const paid = (order.invoice?.payments || []).some((p) => p.status === 'COMPLETED');
     if (paid) return res.status(400).json({ error: 'Cannot cancel an order that has payments' });
@@ -102,8 +108,10 @@ const updateOrderStatus = asyncHandler(async (req, res) => {
 
   const updated = await prisma.$transaction(async (tx) => {
     // Only apply if nobody changed the status since we read it; a dispute remembers where the order was
+    // (a dispute also requires that receipt wasn't confirmed meanwhile)
     const data = status === 'DISPUTED' ? { status, statusBeforeDispute: order.status } : { status };
-    const { count } = await tx.order.updateMany({ where: { id: order.id, status: order.status }, data });
+    const where = status === 'DISPUTED' ? { id: order.id, status: order.status, receivedAt: null } : { id: order.id, status: order.status };
+    const { count } = await tx.order.updateMany({ where, data });
     if (count === 0) throw Object.assign(new Error('Order status changed meanwhile; reload and try again'), { status: 409 });
     if (status === 'DISPUTED' && reason) {
       await tx.message.create({ data: { orderId: order.id, senderCompanyId: req.user.companyId, body: DISPUTE_PREFIX + reason } });
@@ -158,9 +166,9 @@ const listOrdersAdmin = asyncHandler(async (req, res) => {
 const STATUS_FROM_DELIVERY = { PENDING: 'CONFIRMED', DISPATCHED: 'SHIPPED', IN_TRANSIT: 'SHIPPED', FAILED: 'SHIPPED', DELIVERED: 'DELIVERED' };
 
 // POST /api/admin/orders/:id/resolve-dispute  (admin)  body: { action: 'RESUME' | 'CANCEL', comment }
-// RESUME returns the order to its status before the dispute (COMPLETED if the invoice got fully paid
-// meanwhile, as the payment would have done); CANCEL cancels it like a normal cancellation. The comment
-// goes to the order chat as an admin message and both parties are notified.
+// RESUME returns the order to its status before the dispute (never COMPLETED: disputes happen before
+// receipt, and an order completes only once received and paid); CANCEL cancels it like a normal
+// cancellation. The comment goes to the order chat as an admin message and both parties are notified.
 const resolveDispute = asyncHandler(async (req, res) => {
   const { action } = req.body;
   const comment = typeof req.body.comment === 'string' ? req.body.comment.trim() : '';
@@ -185,8 +193,7 @@ const resolveDispute = asyncHandler(async (req, res) => {
       to = 'CANCELLED';
       if (current.invoice) await closeInvoiceOnCancel(tx, current.invoice.id);
     } else {
-      to = current.invoice && current.invoice.status === 'PAID' ? 'COMPLETED'
-        : current.statusBeforeDispute || STATUS_FROM_DELIVERY[current.delivery?.status] || 'CONFIRMED';
+      to = current.statusBeforeDispute || STATUS_FROM_DELIVERY[current.delivery?.status] || 'CONFIRMED';
     }
     await tx.order.update({ where: { id: order.id }, data: { status: to, statusBeforeDispute: null } });
     const verdict = action === 'CANCEL' ? 'order cancelled' : 'order resumed (' + statusLabel(to) + ')';
@@ -251,4 +258,48 @@ const updateDelivery = asyncHandler(async (req, res) => {
   notify(order.lpo.buyerCompanyId, 'DELIVERY', label, trackingInfo ? 'Tracking: ' + trackingInfo : undefined, order.id);
 });
 
-module.exports = { listOrders, getOrder, updateOrderStatus, updateDelivery, listOrdersAdmin, resolveDispute };
+// Receipt can be confirmed once the goods are on their way or delivered (not while disputed).
+const RECEIPT_FROM = ['SHIPPED', 'DELIVERED'];
+const RECEIPT_TEXT = 'Receipt confirmed: all goods received in the agreed quantity and quality.';
+
+// POST /api/orders/:id/receipt  (buyer)  body: { comment? }
+// The buyer accepts the goods. Recorded with the time and posted to the order chat; the delivery is marked
+// DELIVERED if the supplier hadn't; the invoice becomes payable (issuedAt = receipt time); disputes close.
+// An invoice already fully paid (payments reported before receipt was required) completes the order here.
+const confirmReceipt = asyncHandler(async (req, res) => {
+  const comment = typeof req.body.comment === 'string' ? req.body.comment.trim() : '';
+  if (comment.length > MAX_COMMENT) return res.status(400).json({ error: `comment must be at most ${MAX_COMMENT} characters` });
+  const { order, isBuyer, error } = await loadOrderWithAccessCheck(req.params.id, req.user);
+  if (error) return res.status(error.status).json({ error: error.message });
+  if (!isBuyer) return res.status(403).json({ error: 'Only the buyer can confirm receipt' });
+
+  const result = await prisma.$transaction(async (tx) => {
+    // invoice first, then order — the same lock order as payments and dispute resolution
+    if (order.invoice) await tx.$queryRaw`SELECT id FROM "Invoice" WHERE id = ${order.invoice.id} FOR UPDATE`;
+    await tx.$queryRaw`SELECT id FROM "Order" WHERE id = ${order.id} FOR UPDATE`;
+    const current = await tx.order.findUnique({ where: { id: order.id }, include: { invoice: true, delivery: true } });
+    if (current.receivedAt) throw Object.assign(new Error('Receipt was already confirmed'), { status: 400 });
+    if (!RECEIPT_FROM.includes(current.status)) {
+      throw Object.assign(new Error(`Receipt can be confirmed once the order is shipped (order is ${current.status})`), { status: 400 });
+    }
+
+    const now = new Date();
+    if (current.delivery && current.delivery.status !== 'DELIVERED') {
+      await tx.delivery.update({ where: { orderId: order.id }, data: { status: 'DELIVERED', deliveredAt: current.delivery.deliveredAt || now } });
+    }
+    const paid = current.invoice && current.invoice.status === 'PAID';
+    if (current.invoice && current.invoice.status !== 'CANCELLED') {
+      await tx.invoice.update({ where: { id: current.invoice.id }, data: { issuedAt: now } });
+    }
+    await tx.order.update({ where: { id: order.id }, data: { receivedAt: now, status: paid ? 'COMPLETED' : 'DELIVERED' } });
+    await tx.message.create({ data: { orderId: order.id, senderCompanyId: req.user.companyId, body: RECEIPT_TEXT + (comment ? ' Note: ' + comment : '') } });
+    return tx.order.findUnique({ where: { id: order.id } });
+  });
+  res.json(result);
+
+  const title = order.lpo.rfq?.title;
+  notify(order.lpo.supplierCompanyId, 'RECEIPT_CONFIRMED', 'Buyer confirmed receipt',
+    'The buyer confirmed receipt' + (title ? ' of "' + title + '"' : '') + '. The invoice is now payable.' + (comment ? ' Note: ' + comment.slice(0, 200) : ''), order.id);
+});
+
+module.exports = { listOrders, getOrder, updateOrderStatus, updateDelivery, listOrdersAdmin, resolveDispute, confirmReceipt };
