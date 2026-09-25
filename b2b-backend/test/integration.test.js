@@ -1338,7 +1338,6 @@ async function newRfq(budget = 500, extra = {}) {
   r = await runScript('--clear-invalid-images', '--apply');
   check('--clear-invalid-images --apply: both cleared, valid photos untouched', r.code === 0 && (await itemNow(2)).imageUrl === null && (await itemNow(3)).imageUrl === null && (await itemNow(0)).imageKey === m0.imageKey, r.out);
   check('unknown option -> exit 2', (await runScript('--aply')).code === 2);
-  s3Server.close();
 
   console.log('\n== 18c8. public stats for the landing page ==');
   const publicCtrl = require(path.join(root, 'src/controllers/public.controller'));
@@ -1664,6 +1663,54 @@ async function newRfq(budget = 500, extra = {}) {
   r = await call('PATCH', `/rfqs/${specRfq.id}`, B1, { specifications: 'Changed after a quote' });
   check('frozen after the first quote -> 409', r.status === 409 && (await db.rFQ.findUnique({ where: { id: specRfq.id } })).specifications === 'Updated spec', r.data);
   check('DB refuses more than 2000 characters (CHECK)', await db.rFQ.update({ where: { id: specRfq.id }, data: { specifications: 'y'.repeat(2001) } }).then(() => false, () => true));
+
+  console.log('\n== 18c14. stage 6: decline reason, close bidding, catalog edit, updated verification document ==');
+  await db.wallet.updateMany({ where: { companyId: { in: ['sup1', 'sup2'] } }, data: { balance: 100 } });
+  const drRfq = await newRfq(100, { title: 'decline reason rfq', quantity: 4 });
+  await call('POST', `/rfqs/${drRfq.id}/quotes`, S1, { unitPrice: 5 });
+  await call('POST', `/rfqs/${drRfq.id}/quotes`, S2, { unitPrice: 6 });
+  const drQ1 = await db.quote.findFirst({ where: { rfqId: drRfq.id, supplierCompanyId: 'sup1' } });
+  await call('POST', `/quotes/${drQ1.id}/award`, B1, {});
+  const drLpo = await db.lPO.findFirst({ where: { quoteId: drQ1.id } });
+  r = await call('PATCH', `/lpos/${drLpo.id}/decline`, S1, { reason: '  Out of stock until next month  ' });
+  check('decline with a reason -> stored on the LPO', r.status === 200 && (await db.lPO.findUnique({ where: { id: drLpo.id } })).declineReason === 'Out of stock until next month', r.data);
+  await settle();
+  check('...buyer notified with the reason', (await db.notification.count({ where: { companyId: 'buyer1', type: 'LPO_DECLINED', body: { contains: 'Out of stock until next month' } } })) === 1);
+  r = await call('GET', `/rfqs/${drRfq.id}/quotes`, B1);
+  const drRow = r.data.find((q) => q.id === drQ1.id);
+  check('...Compare bids shows the declined LPO and its reason', drRow && drRow.lpo && drRow.lpo.status === 'DECLINED' && drRow.lpo.declineReason === 'Out of stock until next month', drRow && drRow.lpo);
+  check('...the other supplier sees nothing of it', !JSON.stringify((await call('GET', `/rfqs/${drRfq.id}/quotes`, S2)).data).includes('Out of stock'));
+  const drQ2 = await db.quote.findFirst({ where: { rfqId: drRfq.id, supplierCompanyId: 'sup2' } });
+  await call('POST', `/quotes/${drQ2.id}/award`, B1, {});
+  const drLpo2 = await db.lPO.findFirst({ where: { quoteId: drQ2.id } });
+  await call('PATCH', `/lpos/${drLpo2.id}/decline`, S2, {});
+  check('decline without a reason -> null', (await db.lPO.findUnique({ where: { id: drLpo2.id } })).declineReason === null);
+  // close bidding early (the UI button uses PATCH status QUOTING_CLOSED)
+  const cbRfq = await newRfq(100, { title: 'close bidding rfq', quantity: 2 });
+  await call('POST', `/rfqs/${cbRfq.id}/quotes`, S1, { unitPrice: 5 });
+  check('buyer closes bidding -> QUOTING_CLOSED', (await call('PATCH', `/rfqs/${cbRfq.id}`, B1, { status: 'QUOTING_CLOSED' })).data.status === 'QUOTING_CLOSED');
+  check('...hidden from the supplier feed, new quotes refused', !(await call('GET', '/rfqs', S2)).data.some((x) => x.id === cbRfq.id) &&
+    (await call('POST', `/rfqs/${cbRfq.id}/quotes`, S2, { unitPrice: 4 })).status === 400);
+  const cbQ = await db.quote.findFirst({ where: { rfqId: cbRfq.id } });
+  check('...the buyer can still award', (await call('POST', `/quotes/${cbQ.id}/award`, B1, {})).status === 201);
+  // catalog edit: fields and photo
+  r = await call('POST', '/catalog', S1, { name: 'edit me', price: 2, unit: 'kg', imageUrl: JPG_URL });
+  const edItem = r.data;
+  const edKey1 = (await db.catalogItem.findUnique({ where: { id: edItem.id } })).imageKey;
+  r = await call('PATCH', `/catalog/${edItem.id}`, S1, { name: 'edited', price: 2.5, unit: 'box', imageUrl: dataUrl('image/png', PNG_BYTES) });
+  const edRow = await db.catalogItem.findUnique({ where: { id: edItem.id } });
+  check('edit: name, price, unit and a new photo', r.status === 200 && edRow.name === 'edited' && edRow.price.toString() === '2.5' && edRow.unit === 'box' &&
+    edRow.imageKey && edRow.imageKey !== edKey1 && edRow.imageContentType === 'image/png' && s3Store.get('/test-bucket/' + edRow.imageKey).body.equals(PNG_BYTES) && !('imageKey' in r.data), r.data);
+  check('edit: invalid photo -> 400, item unchanged', (await call('PATCH', `/catalog/${edItem.id}`, S1, { imageUrl: 'https://evil.example/x.png' })).status === 400 &&
+    (await db.catalogItem.findUnique({ where: { id: edItem.id } })).imageKey === edRow.imageKey);
+  r = await call('PATCH', `/catalog/${edItem.id}`, S1, { imageUrl: null });
+  check('edit: remove the photo', r.status === 200 && (await db.catalogItem.findUnique({ where: { id: edItem.id } })).imageKey === null && !r.data.imageUrl, r.data);
+  check('edit: other supplier -> 403', (await call('PATCH', `/catalog/${edItem.id}`, S2, { name: 'hijack' })).status === 403);
+  // an already verified company can submit an updated verification document and stays verified
+  r = await call('POST', '/companies/me/documents', S1, { fileUrl: dataUrl('application/pdf', PDF_BYTES), docType: 'TRADE_LICENSE' });
+  check('verified company uploads an updated document -> 201, still VERIFIED', r.status === 201 && (await db.company.findUnique({ where: { id: 'sup1' } })).verificationStatus === 'VERIFIED');
+
+  s3Server.close(); // the local S3 stand-in serves every section above
 
   console.log('\n== 18d. L6 change-password attempts limited per user ==');
   await mkCo('sup11', 'SUPPLIER', 0); await mkCo('sup12', 'SUPPLIER', 0);

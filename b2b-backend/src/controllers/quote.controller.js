@@ -103,6 +103,8 @@ const listQuotesForRFQ = asyncHandler(async (req, res) => {
       supplierCompany: { select: { id: true, name: true, verificationStatus: true } },
       // live attachments (a supplier only ever gets its own quote here)
       attachments: { where: { deletedAt: null }, select: ATTACHMENT_SELECT, orderBy: { createdAt: 'asc' } },
+      // the LPO issued for this quote, with the supplier's reason if it was declined
+      lpo: { select: { status: true, declineReason: true } },
     },
     orderBy: { price: 'asc' },
   });

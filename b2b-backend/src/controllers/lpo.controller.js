@@ -107,7 +107,8 @@ const declineLPO = asyncHandler(async (req, res) => {
 
   const updated = await prisma.$transaction(async (tx) => {
     await tx.$queryRaw`SELECT id FROM "RFQ" WHERE id = ${lpo.rfqId} FOR UPDATE`;
-    const { count } = await tx.lPO.updateMany({ where: { id: lpo.id, status: 'ISSUED' }, data: { status: 'DECLINED' } });
+    // the reason is kept on the LPO, so the buyer sees it next to the quote (and gets it in the notification)
+    const { count } = await tx.lPO.updateMany({ where: { id: lpo.id, status: 'ISSUED' }, data: { status: 'DECLINED', declineReason: reason || null } });
     if (count === 0) throw Object.assign(new Error('LPO is no longer in ISSUED status'), { status: 400 });
 
     await tx.quote.update({ where: { id: lpo.quoteId }, data: { status: 'REJECTED', statusBeforeAward: null } });
