@@ -13,11 +13,21 @@ async function presentItem(item) {
   return { ...rest, imageUrl: storage.isConfigured() ? await storage.presignStable(imageKey, imageContentType) : null };
 }
 
+// Only verified suppliers list products; buyers see nothing from companies the team hasn't checked
+const NOT_VERIFIED = 'Available after verification: your company must be verified before adding or editing catalog items';
+async function isVerified(companyId) {
+  const c = await prisma.company.findUnique({ where: { id: companyId }, select: { verificationStatus: true } });
+  return !!c && c.verificationStatus === 'VERIFIED';
+}
+// whose items others may see: verified suppliers with an active company and account
+const VISIBLE_SUPPLIER = { isActive: true, verificationStatus: 'VERIFIED', user: { isActive: true } };
+
 // POST /api/catalog  (supplier)  body: { name, price, description?, unit?, category?, imageUrl?: data: URL }
 // The photo must be a JPEG, PNG or WebP data: URL under 2MB (checked by content); it is stored in the bucket.
 const createItem = asyncHandler(async (req, res) => {
   const { name, description, unit, category, imageUrl } = req.body;
   if (!name || req.body.price === undefined) return res.status(400).json({ error: 'name and price required' });
+  if (!await isVerified(req.user.companyId)) return res.status(403).json({ error: NOT_VERIFIED });
   const price = parseAmount(req.body.price, 'price');
   if (price.error) return res.status(400).json({ error: price.error });
 
@@ -43,15 +53,16 @@ const createItem = asyncHandler(async (req, res) => {
   res.status(201).json(await presentItem(item));
 });
 
-// GET /api/catalog  - public/browsable, optional filters
+// GET /api/catalog  - browsable by signed-in users, optional filters. Others' items only from verified, active
+// suppliers; a supplier always sees its own (e.g. while back in review after a name change).
 const listItems = asyncHandler(async (req, res) => {
   const { category, supplierCompanyId } = req.query;
   const items = await prisma.catalogItem.findMany({
     where: {
       isActive: true,
-      supplierCompany: { isActive: true }, // hide items of deactivated suppliers
       category: category || undefined,
       supplierCompanyId: supplierCompanyId || undefined,
+      OR: [{ supplierCompany: VISIBLE_SUPPLIER }, ...(req.user.companyId ? [{ supplierCompanyId: req.user.companyId }] : [])],
     },
     include: { supplierCompany: { select: { id: true, name: true } } },
     orderBy: { createdAt: 'desc' },
@@ -64,6 +75,7 @@ const updateItem = asyncHandler(async (req, res) => {
   const existing = await prisma.catalogItem.findUnique({ where: { id: req.params.id } });
   if (!existing) return res.status(404).json({ error: 'Item not found' });
   if (existing.supplierCompanyId !== req.user.companyId) return res.status(403).json({ error: 'Forbidden' });
+  if (!await isVerified(req.user.companyId)) return res.status(403).json({ error: NOT_VERIFIED });
 
   const { name, description, unit, category, isActive } = req.body;
   let price;
