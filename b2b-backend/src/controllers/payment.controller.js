@@ -71,6 +71,8 @@ const recordPayment = asyncHandler(async (req, res) => {
     const invoice = await lockInvoice(tx, existing.id);
     if (invoice.status === 'PAID') throw fail(400, 'This invoice is already paid');
     if (invoice.status === 'CANCELLED' || invoice.order.status === 'CANCELLED') throw fail(400, 'Cannot pay a cancelled invoice');
+    // payment follows acceptance: checked under the invoice lock, which receipt confirmation also takes
+    if (!invoice.order.receivedAt) throw fail(400, 'The invoice becomes payable once you confirm receipt of the goods');
 
     const totals = await invoiceTotals(tx, invoice);
     if (totals.outstanding.lte(0)) {
@@ -119,8 +121,13 @@ const confirmPayment = asyncHandler(async (req, res) => {
     const status = paid.gte(invoice.amount) ? 'PAID' : 'PARTIALLY_PAID';
     const updatedInvoice = await tx.invoice.update({ where: { id: invoice.id }, data: { status } });
     if (status === 'PAID') {
-      // a disputed order stays DISPUTED until an admin resolves it
-      await tx.order.updateMany({ where: { id: invoice.orderId, status: { notIn: ['DISPUTED', 'CANCELLED'] } }, data: { status: 'COMPLETED' } });
+      // An order completes once received and paid: a payment reported before receipt was required can
+      // fully pay an order that isn't received yet — receipt confirmation completes it then.
+      // A disputed order stays DISPUTED until an admin resolves it.
+      await tx.order.updateMany({
+        where: { id: invoice.orderId, status: { notIn: ['DISPUTED', 'CANCELLED'] }, receivedAt: { not: null } },
+        data: { status: 'COMPLETED' },
+      });
     }
     return { payment: await tx.payment.findUnique({ where: { id: payment.id } }), invoice: updatedInvoice };
   });

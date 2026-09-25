@@ -271,6 +271,8 @@ model Order {
   status    OrderStatus @default(CONFIRMED)
   // set when the buyer opens a dispute, so an admin can resume the order where it was
   statusBeforeDispute OrderStatus?
+  // the buyer confirmed the goods arrived in the agreed quantity and quality; the invoice is payable from here
+  receivedAt DateTime?
   createdAt DateTime    @default(now())
   updatedAt DateTime    @updatedAt
 
