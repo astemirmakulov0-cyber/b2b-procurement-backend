@@ -56,4 +56,13 @@ function cleanFileName(name) {
   return (base || 'document').slice(0, 200);
 }
 
-module.exports = { MAX_FILE_BYTES, readSingleFile, sniffType, cleanFileName };
+const EXTENSIONS = { 'application/pdf': ['.pdf'], 'image/png': ['.png'], 'image/jpeg': ['.jpg', '.jpeg'], 'image/webp': ['.webp'] };
+
+// The stored name: the cleaned original, with an extension that matches the real content
+function storedFileName(name, contentType) {
+  const fileName = cleanFileName(name);
+  if (EXTENSIONS[contentType].some((ext) => fileName.toLowerCase().endsWith(ext))) return fileName;
+  return fileName.slice(0, 195) + EXTENSIONS[contentType][0];
+}
+
+module.exports = { MAX_FILE_BYTES, readSingleFile, sniffType, cleanFileName, storedFileName };

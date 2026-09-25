@@ -1095,6 +1095,131 @@ async function newRfq(budget = 500, extra = {}) {
   r = await upload(dso.order.id, B1, { kind: 'OTHER', file: PDF_BYTES });
   check('51st document -> 400', r.status === 400 && /at most 50/.test(r.data.error), r.data);
   check('DB rejects kind outside the list (CHECK)', await db.orderDocument.create({ data: { orderId: dso.order.id, kind: 'CONTRACT', fileName: 'x', contentType: 'application/pdf', sizeBytes: 1, storageKey: 'seed/x', uploadedByCompanyId: 'sup2' } }).then(() => false, () => true));
+
+  console.log('\n== 18c6. L4 bid attachments: private to supplier, buyer, admin ==');
+  const uploadAtt = async (quoteId, tokn, file = PDF_BYTES, name = 'spec.pdf') => {
+    const form = new FormData();
+    if (file) form.append('file', new Blob([file]), name);
+    const res = await fetch(`${BASE}/quotes/${quoteId}/attachments`, { method: 'POST', headers: { Authorization: 'Bearer ' + tokn }, body: form });
+    let data = null; try { data = await res.json(); } catch (e) {}
+    return { status: res.status, data };
+  };
+  const attRows = (quoteId) => db.quoteAttachment.count({ where: { quoteId, deletedAt: null } });
+  const quoteOf = async (rfqId, supId) => db.quote.findFirst({ where: { rfqId, supplierCompanyId: supId } });
+  await db.wallet.updateMany({ where: { companyId: { in: ['sup1', 'sup2', 'sup3'] } }, data: { balance: 100 } });
+  const arfq = await newRfq(100, { title: 'L9 attachments RFQ' });
+  for (const [s, price] of [[S1, 50], [S2, 60], [S3, 70]]) await call('POST', `/rfqs/${arfq.id}/quotes`, s, { price });
+  const aq1 = await quoteOf(arfq.id, 'sup1'), aq2 = await quoteOf(arfq.id, 'sup2'), aq3 = await quoteOf(arfq.id, 'sup3');
+
+  r = await uploadAtt(aq1.id, S1, PDF_BYTES, 'ISO 9001 certificate.pdf');
+  const att1 = r.data;
+  const att1Row = att1 && await db.quoteAttachment.findUnique({ where: { id: att1.id } });
+  check('supplier attaches a PDF to its quote -> 201', r.status === 201 && att1.fileName === 'ISO 9001 certificate.pdf' && att1.sizeBytes === PDF_BYTES.length && !('storageKey' in att1), r.data);
+  check('...stored under quotes/<quoteId>/<uuid>', !!att1Row && att1Row.storageKey.startsWith('quotes/' + aq1.id + '/') && s3Store.get('/test-bucket/' + att1Row.storageKey).body.equals(PDF_BYTES));
+  check('buyer cannot attach -> 403', (await uploadAtt(aq1.id, B1)).status === 403);
+  check('another supplier: quote "not found" -> 404', (await uploadAtt(aq1.id, S2)).status === 404);
+  check('fake PDF -> 415', (await uploadAtt(aq1.id, S1, Buffer.from('not a pdf'), 'x.pdf')).status === 415);
+  check('no file -> 400', (await uploadAtt(aq1.id, S1, null)).status === 400);
+  for (const [f, n] of [[PNG_BYTES, 'photo 1.png'], [JPG_BYTES, 'photo 2'], [PDF_BYTES, 'datasheet.pdf'], [PDF_BYTES, 'price list.pdf']]) await uploadAtt(aq1.id, S1, f, n);
+  r = await uploadAtt(aq1.id, S1);
+  check('6th attachment -> 400, 5 kept', r.status === 400 && /at most 5/.test(r.data.error) && (await attRows(aq1.id)) === 5, r.data);
+  // parallel uploads can't exceed 5 (checked again under the RFQ lock)
+  const parUp = await Promise.all(Array.from({ length: 7 }, (_, i) => uploadAtt(aq2.id, S2, PDF_BYTES, `p${i}.pdf`)));
+  check('7 parallel uploads -> exactly 5 stored', parUp.filter((x) => x.status === 201).length === 5 && parUp.filter((x) => x.status === 400).length === 2 && (await attRows(aq2.id)) === 5, parUp.map((x) => x.status));
+
+  // who sees what
+  r = await call('GET', `/quotes/${aq1.id}/attachments`, S1);
+  check('supplier lists own attachments (oldest first, no keys)', r.status === 200 && r.data.length === 5 && r.data[0].id === att1.id && r.data.every((x) => !('storageKey' in x)));
+  check('buyer and admin list them', (await call('GET', `/quotes/${aq1.id}/attachments`, B1)).data.length === 5 && (await call('GET', `/quotes/${aq1.id}/attachments`, ADM)).data.length === 5);
+  check('other supplier / other buyer -> 404', (await call('GET', `/quotes/${aq1.id}/attachments`, S2)).status === 404 && (await call('GET', `/quotes/${aq1.id}/attachments`, B2)).status === 404);
+  r = await call('GET', `/rfqs/${arfq.id}/quotes`, B1);
+  check('Compare bids: buyer sees each quote\'s attachments', r.status === 200 && r.data.find((q) => q.id === aq1.id).attachments.length === 5 && r.data.find((q) => q.id === aq2.id).attachments.length === 5 &&
+    r.data.find((q) => q.id === aq3.id).attachments.length === 0);
+  const s1AttIds = (await db.quoteAttachment.findMany({ where: { quoteId: aq1.id } })).map((a) => a.id);
+  const leaks = (json) => [aq1.id, ...s1AttIds].some((id) => JSON.stringify(json).includes(id));
+  r = await call('GET', `/rfqs/${arfq.id}/quotes`, S3);
+  check('another supplier gets only its own quote (0 attachments), nothing of sup1', r.data.length === 1 && r.data[0].id === aq3.id && r.data[0].attachments.length === 0 && !leaks(r.data), r.data);
+  const listS3 = (await call('GET', '/rfqs', S3)).data.find((x) => x.id === arfq.id);
+  check('RFQ list for another supplier: own quote count only, nothing of sup1', listS3.quotes.length === 1 && listS3.quotes[0]._count.attachments === 0 && !leaks(listS3), listS3.quotes);
+  const listS1 = (await call('GET', '/rfqs', S1)).data.find((x) => x.id === arfq.id);
+  check('RFQ list for the supplier: its own attachment count', listS1.quotes[0]._count.attachments === 5);
+  check('RFQ detail for another supplier leaks nothing of sup1', !leaks((await call('GET', `/rfqs/${arfq.id}`, S3)).data));
+
+  // download
+  r = await call('GET', `/quote-attachments/${att1.id}/download`, B1);
+  const au = r.status === 200 && new URL(r.data.url);
+  check('buyer downloads: presigned 120 s, attachment disposition', r.status === 200 && au.searchParams.get('X-Amz-Expires') === '120' && au.pathname === '/test-bucket/' + att1Row.storageKey &&
+    /^attachment; filename="ISO 9001 certificate\.pdf"/.test(au.searchParams.get('response-content-disposition')), r.data);
+  check('supplier and admin download', (await call('GET', `/quote-attachments/${att1.id}/download`, S1)).status === 200 && (await call('GET', `/quote-attachments/${att1.id}/download`, ADM)).status === 200);
+  check('other supplier / other buyer -> 404', (await call('GET', `/quote-attachments/${att1.id}/download`, S2)).status === 404 && (await call('GET', `/quote-attachments/${att1.id}/download`, B2)).status === 404);
+
+  // delete while SUBMITTED
+  check('buyer cannot delete -> 403', (await call('DELETE', `/quote-attachments/${att1.id}`, B1)).status === 403);
+  check('other supplier -> 404', (await call('DELETE', `/quote-attachments/${att1.id}`, S2)).status === 404);
+  const lastId = (await call('GET', `/quotes/${aq1.id}/attachments`, S1)).data[4].id;
+  check('supplier removes one -> 200, 4 left, file kept', (await call('DELETE', `/quote-attachments/${lastId}`, S1)).status === 200 && (await attRows(aq1.id)) === 4 &&
+    s3Store.has('/test-bucket/' + (await db.quoteAttachment.findUnique({ where: { id: lastId } })).storageKey));
+  check('...removed one: download 404, delete again 404', (await call('GET', `/quote-attachments/${lastId}/download`, B1)).status === 404 && (await call('DELETE', `/quote-attachments/${lastId}`, S1)).status === 404);
+
+  // frozen after shortlist / rejection, and when the RFQ stops taking quotes
+  await call('PATCH', `/quotes/${aq1.id}/shortlist`, B1);
+  r = await uploadAtt(aq1.id, S1);
+  check('after shortlist: upload -> 400 (frozen)', r.status === 400 && /frozen once the quote is shortlisted/.test(r.data.error), r.data);
+  check('after shortlist: delete -> 400', (await call('DELETE', `/quote-attachments/${att1.id}`, S1)).status === 400 && (await attRows(aq1.id)) === 4);
+  check('...buyer still sees the 4 files it evaluates', (await call('GET', `/quotes/${aq1.id}/attachments`, B1)).data.length === 4);
+  await call('PATCH', `/quotes/${aq3.id}/reject`, B1);
+  check('after rejection: upload -> 400', (await uploadAtt(aq3.id, S3)).status === 400);
+  const rq2 = await newRfq(100, { title: 'L9 attachments deadline' });
+  await call('POST', `/rfqs/${rq2.id}/quotes`, S3, { price: 40 });
+  const dq = await quoteOf(rq2.id, 'sup3');
+  check('before the deadline: upload -> 201', (await uploadAtt(dq.id, S3)).status === 201);
+  await db.rFQ.update({ where: { id: rq2.id }, data: { deadline: new Date(Date.now() - 1000) } });
+  r = await uploadAtt(dq.id, S3);
+  check('after the deadline: upload -> 400', r.status === 400 && /deadline/.test(r.data.error), r.data);
+  await db.rFQ.update({ where: { id: rq2.id }, data: { deadline: new Date(Date.now() + 86400e3), status: 'QUOTING_CLOSED' } });
+  check('RFQ QUOTING_CLOSED: upload / delete -> 400', (await uploadAtt(dq.id, S3)).status === 400 &&
+    (await call('DELETE', `/quote-attachments/${(await call('GET', `/quotes/${dq.id}/attachments`, S3)).data[0].id}`, S3)).status === 400);
+
+  // upload racing a shortlist: an attachment never lands after the shortlist
+  for (let round = 1; round <= 4; round++) {
+    const rr = await newRfq(100, { title: 'L9 race ' + round });
+    await call('POST', `/rfqs/${rr.id}/quotes`, S3, { price: 30 });
+    const rq = await quoteOf(rr.id, 'sup3');
+    const [up, sl] = await Promise.all([uploadAtt(rq.id, S3), call('PATCH', `/quotes/${rq.id}/shortlist`, B1)]);
+    const after = await db.quote.findUnique({ where: { id: rq.id } });
+    const rows = await db.quoteAttachment.findMany({ where: { quoteId: rq.id } });
+    const ok = sl.status === 200 && after.status === 'SHORTLISTED' && ((up.status === 201 && rows.length === 1 && rows[0].createdAt <= after.updatedAt) || (up.status === 400 && rows.length === 0));
+    check(`upload vs shortlist race (round ${round}): no attachment after the shortlist`, ok, { upload: up.status, shortlist: sl.status, rows: rows.length });
+  }
+
+  // award + LPO acceptance: the winning bid's attachments become order documents
+  check('award sup1 -> 201', (await call('POST', `/quotes/${aq1.id}/award`, B1, {})).status === 201);
+  const alpo = await db.lPO.findFirst({ where: { quoteId: aq1.id } });
+  check('no order documents before acceptance', (await db.orderDocument.count({ where: { storageKey: att1Row.storageKey } })) === 0);
+  r = await call('PATCH', `/lpos/${alpo.id}/accept`, S1);
+  const aorder = r.data.order;
+  const odocs = (await call('GET', `/orders/${aorder.id}/documents`, B1)).data;
+  const liveKeys = (await db.quoteAttachment.findMany({ where: { quoteId: aq1.id, deletedAt: null }, orderBy: { createdAt: 'asc' } })).map((a) => a.storageKey);
+  const odRows = await db.orderDocument.findMany({ where: { orderId: aorder.id }, orderBy: { createdAt: 'asc' } });
+  check('LPO accepted -> 4 bid attachments in order documents (removed one excluded)', odocs.length === 4 && odocs.every((d) => d.kind === 'QUOTE_ATTACHMENT' && d.uploadedByCompanyId === 'sup1') &&
+    JSON.stringify(odRows.map((d) => d.storageKey).sort()) === JSON.stringify([...liveKeys].sort()), odocs.map((d) => d.fileName));
+  const odl = new URL((await call('GET', `/documents/${odocs[0].id}/download`, B1)).data.url);
+  check('...downloadable from the order (same stored file)', odRows.map((d) => '/test-bucket/' + d.storageKey).includes(odl.pathname));
+  r = await call('DELETE', `/documents/${odocs[0].id}`, S1);
+  check('...supplier cannot remove a bid attachment from the order -> 400', r.status === 400 && /part of the accepted quote/.test(r.data.error), r.data);
+  const qaForm = new FormData(); qaForm.append('kind', 'QUOTE_ATTACHMENT'); qaForm.append("file", new Blob([PDF_BYTES]), "x.pdf");
+  check('...kind QUOTE_ATTACHMENT cannot be uploaded directly -> 400', (await fetch(`${BASE}/orders/${aorder.id}/documents`, { method: 'POST', headers: { Authorization: 'Bearer ' + S1 }, body: qaForm })).status === 400);
+  check('losing bid\'s attachments stay visible to its supplier and the buyer', (await call('GET', `/quotes/${aq2.id}/attachments`, S2)).data.length === 5 && (await call('GET', `/quotes/${aq2.id}/attachments`, B1)).data.length === 5);
+
+  // deleting a company without trading history removes its quotes' attachment rows too
+  await mkCo('sup13', 'SUPPLIER', 100);
+  const S13 = tok('SUPPLIER', 'sup13');
+  const hrfq = await newRfq(100, { title: 'L9 hard delete' });
+  await call('POST', `/rfqs/${hrfq.id}/quotes`, S13, { price: 20 });
+  const hq = await quoteOf(hrfq.id, 'sup13');
+  await uploadAtt(hq.id, S13);
+  r = await call('DELETE', '/admin/companies/sup13', ADM);
+  check('delete supplier with attachments, no trading history -> deleted, rows gone', r.status === 200 && r.data.mode === 'deleted' && (await db.quoteAttachment.count({ where: { quoteId: hq.id } })) === 0, r.data);
   s3Server.close();
 
   console.log('\n== 18d. L6 change-password attempts limited per user ==');

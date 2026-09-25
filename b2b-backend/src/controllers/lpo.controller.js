@@ -80,6 +80,14 @@ const acceptLPO = asyncHandler(async (req, res) => {
     });
     await tx.delivery.create({ data: { orderId: order.id } });
     await tx.invoice.create({ data: { orderId: order.id, amount: lpo.totalAmount } });
+    // the winning bid's attachments become order documents (same stored objects; the quote is frozen by now)
+    const attachments = await tx.quoteAttachment.findMany({ where: { quoteId: lpo.quoteId, deletedAt: null }, orderBy: { createdAt: 'asc' } });
+    if (attachments.length) {
+      await tx.orderDocument.createMany({ data: attachments.map((a) => ({
+        orderId: order.id, kind: 'QUOTE_ATTACHMENT', fileName: a.fileName, contentType: a.contentType, sizeBytes: a.sizeBytes,
+        storageKey: a.storageKey, uploadedByCompanyId: lpo.supplierCompanyId,
+      })) });
+    }
     return { lpo: updated, order };
   });
 

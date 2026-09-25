@@ -75,7 +75,10 @@ const listRFQs = asyncHandler(async (req, res) => {
     const rfqs = await prisma.rFQ.findMany({
       where,
       // only the supplier's own quote, so the UI knows which RFQs it has already bid on
-      include: { quotes: { where: { supplierCompanyId: req.user.companyId }, select: { id: true, status: true, price: true, createdAt: true } } },
+      include: { quotes: { where: { supplierCompanyId: req.user.companyId }, select: {
+        id: true, status: true, price: true, createdAt: true,
+        _count: { select: { attachments: { where: { deletedAt: null } } } }, // own attachments only
+      } } },
       orderBy: { createdAt: 'desc' },
     });
     // The buyer stays anonymous until award (no buyerCompanyId, which would let suppliers group RFQs
