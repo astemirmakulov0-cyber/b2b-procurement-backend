@@ -66,7 +66,7 @@
   cd b2b-backend
   DATABASE_URL="$(node -e "require('dotenv').config({path:'.env.production'});process.stdout.write(process.env.DATABASE_URL)")" npx prisma migrate status
   ```
-- Схема меняется только через `b2b-backend/prisma/migrations` (baseline `0_init` = схема прода на 2026-09-24, затем `1_l2_l3`, `2_order_status_before_dispute`, `3_order_received_at`, `4_order_documents`, `5_quote_attachments`, `6_files_to_bucket`). **`prisma db push` больше не используется.**
+- Схема меняется только через `b2b-backend/prisma/migrations` (baseline `0_init` = схема прода на 2026-09-24, затем `1_l2_l3`, `2_order_status_before_dispute`, `3_order_received_at`, `4_order_documents`, `5_quote_attachments`, `6_files_to_bucket`, `7_quote_unit_price`, `8_rename_active_category` (только данные), `9_rfq_specifications`, `10_lpo_decline_reason`). **`prisma db push` больше не используется.**
 - **Railway**: Custom Start Command — `npm start` (до 2026-09-24 там был `prisma db push --accept-data-loss`, каждый деплой применял схему). Pre-deploy-команды нет.
 - Порядок изменения схемы:
   1. изменить `schema.prisma`, локально `npm run migrate:new -- --name <что_меняем>`, прочитать и при необходимости поправить `migration.sql` (Prisma генерирует `DROP/ADD COLUMN` при смене типа — переписывать на безопасный `ALTER`);
