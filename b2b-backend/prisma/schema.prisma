@@ -270,6 +270,8 @@ model LPO {
   terms              String?
   totalAmount        Decimal   @db.Decimal(12, 3)
   status             LPOStatus @default(ISSUED)
+  // the supplier's reason when it declines the LPO (up to 500 characters, CHECK in migration 10); shown to the buyer
+  declineReason      String?
   createdAt          DateTime  @default(now())
   updatedAt          DateTime  @updatedAt
 
