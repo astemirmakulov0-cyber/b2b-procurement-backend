@@ -4,6 +4,8 @@ const { CANCELLABLE_STATUSES, cancelRfqInTx } = require('../utils/rfqCancel');
 const { parseAmount } = require('../utils/money');
 
 const BUDGET_REQUIRED = 'budget is required to publish an RFQ (suppliers pay 5% of it to submit a quote)';
+const QUANTITY_REQUIRED = 'quantity (a whole number, at least 1) is required to publish an RFQ (quotes are priced per unit)';
+const validQuantity = (q) => Number.isInteger(q) && q >= 1;
 
 // Returns { date } for a valid future deadline, { error } otherwise
 function parseDeadline(value) {
@@ -30,6 +32,8 @@ const createRFQ = asyncHandler(async (req, res) => {
   }
   // The bid fee is 5% of the budget, so a published RFQ without one could never receive a quote
   if (publish && budget === null) return res.status(400).json({ error: BUDGET_REQUIRED });
+  // quotes are priced per unit (total = unit price × quantity), so a published RFQ needs a quantity
+  if (publish && !validQuantity(quantity)) return res.status(400).json({ error: QUANTITY_REQUIRED });
   let deadlineDate = null;
   if (deadline) {
     const parsed = parseDeadline(deadline);
@@ -76,7 +80,7 @@ const listRFQs = asyncHandler(async (req, res) => {
       where,
       // only the supplier's own quote, so the UI knows which RFQs it has already bid on
       include: { quotes: { where: { supplierCompanyId: req.user.companyId }, select: {
-        id: true, status: true, price: true, createdAt: true,
+        id: true, status: true, price: true, unitPrice: true, createdAt: true,
         _count: { select: { attachments: { where: { deletedAt: null } } } }, // own attachments only
       } } },
       orderBy: { createdAt: 'desc' },
@@ -178,6 +182,9 @@ const updateRFQ = asyncHandler(async (req, res) => {
       if (status === 'PUBLISHED' && budget === undefined && existing.budget === null) {
         return { status: 400, error: BUDGET_REQUIRED };
       }
+      if (status === 'PUBLISHED' && !validQuantity(req.body.quantity !== undefined ? req.body.quantity : existing.quantity)) {
+        return { status: 400, error: QUANTITY_REQUIRED };
+      }
     }
 
     // Suppliers pay to quote against the RFQ as it was published, so its content is frozen once quotes exist
@@ -187,6 +194,9 @@ const updateRFQ = asyncHandler(async (req, res) => {
       }
       if (existing._count.quotes > 0) {
         return { status: 409, error: 'Cannot edit an RFQ after quotes have been submitted' };
+      }
+      if (req.body.quantity !== undefined && (status || existing.status) === 'PUBLISHED' && !validQuantity(req.body.quantity)) {
+        return { status: 400, error: QUANTITY_REQUIRED };
       }
     }
 

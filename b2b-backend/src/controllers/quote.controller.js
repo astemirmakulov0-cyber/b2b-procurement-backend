@@ -1,12 +1,15 @@
 const prisma = require('../config/prisma');
 const asyncHandler = require('../utils/asyncHandler');
 const { notify } = require('../utils/notify');
-const { MONEY_DECIMALS, parseAmount, formatAmount } = require('../utils/money');
+const { MONEY_DECIMALS, MONEY_MAX, parseAmount, formatAmount } = require('../utils/money');
 const { ATTACHMENT_SELECT } = require('./quoteAttachment.controller');
 
 const BID_FEE_PERCENT = 0.05; // supplier pays 5% of the RFQ's budget to submit a quote
 
 // POST /api/rfqs/:rfqId/quotes  (supplier, must be verified) - submits a bid, deducts 5% of RFQ budget from wallet
+// body: { unitPrice, deliveryTimeDays } — the price per unit; the quote total (price) = unitPrice × the RFQ quantity.
+// A body with only `price` (pages loaded before unit pricing, where that field was labelled "Unit price") is read as
+// the unit price too.
 const submitQuote = asyncHandler(async (req, res) => {
   const company = await prisma.company.findUnique({ where: { id: req.user.companyId } });
   if (!company || company.verificationStatus !== 'VERIFIED') {
@@ -14,9 +17,9 @@ const submitQuote = asyncHandler(async (req, res) => {
   }
 
   const { rfqId } = req.params;
-  const { price, currency, deliveryTimeDays, notes } = req.body;
-  const parsedPrice = parseAmount(price, 'price');
-  if (parsedPrice.error) return res.status(400).json({ error: parsedPrice.error });
+  const { currency, deliveryTimeDays, notes } = req.body;
+  const parsedUnit = parseAmount(req.body.unitPrice !== undefined ? req.body.unitPrice : req.body.price, 'unitPrice');
+  if (parsedUnit.error) return res.status(400).json({ error: parsedUnit.error });
   if (currency !== undefined && currency !== 'BHD') return res.status(400).json({ error: 'Only BHD is supported' });
 
   const fail = (status, message) => Object.assign(new Error(message), { status });
@@ -29,6 +32,10 @@ const submitQuote = asyncHandler(async (req, res) => {
     if (!rfq || rfq.status !== 'PUBLISHED') throw fail(400, 'RFQ is not open for quotes');
     if (rfq.deadline && rfq.deadline <= new Date()) throw fail(400, 'The deadline for this RFQ has passed');
     if (!rfq.budget) throw fail(400, 'This RFQ has no budget set — cannot calculate bid fee');
+    if (!rfq.quantity || rfq.quantity < 1) throw fail(400, 'This RFQ has no quantity — cannot calculate the quote total');
+    // quantity is a whole number and the unit price has at most 3 decimals, so the total is exact in fils
+    const total = parsedUnit.value.mul(rfq.quantity);
+    if (total.gt(MONEY_MAX)) throw fail(400, 'The quote total (unit price × quantity) is too large');
 
     const alreadyQuoted = await tx.quote.findFirst({
       where: { rfqId, supplierCompanyId: req.user.companyId, status: { not: 'WITHDRAWN' } },
@@ -60,7 +67,8 @@ const submitQuote = asyncHandler(async (req, res) => {
       data: {
         rfqId,
         supplierCompanyId: req.user.companyId,
-        price: parsedPrice.value,
+        price: total,
+        unitPrice: parsedUnit.value,
         currency: 'BHD',
         deliveryTimeDays,
         notes,
@@ -72,7 +80,7 @@ const submitQuote = asyncHandler(async (req, res) => {
   res.status(201).json(result.quote);
   // after commit, so the buyer is only told about quotes that were actually stored
   notify(result.rfq.buyerCompanyId, 'NEW_QUOTE', 'New quote received',
-    'A verified supplier quoted ' + formatAmount(result.quote.price) + ' BHD on "' + result.rfq.title + '". Open Compare bids to review it.');
+    'A verified supplier quoted ' + formatAmount(result.quote.price) + ' BHD total (' + formatAmount(result.quote.unitPrice) + ' BHD × ' + result.rfq.quantity + ') on "' + result.rfq.title + '". Open Compare bids to review it.');
 });
 
 // GET /api/rfqs/:rfqId/quotes  (buyer sees all offers to compare; supplier sees only their own)
