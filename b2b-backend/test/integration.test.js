@@ -962,6 +962,140 @@ async function newRfq(budget = 500, extra = {}) {
     check(`receipt vs dispute race (round ${round}): exactly one wins, consistent`, ok, { receipt: rc.status, dispute: dp.status, order: o.status, receivedAt: !!o.receivedAt });
   }
 
+  console.log('\n== 18c5. L4 order documents in private storage ==');
+  // A minimal local S3 stand-in: stores PUT objects in memory, serves them to presigned GETs (the signature
+  // itself isn't verified; what the SDK sends and what the presigned URL asks for is checked below).
+  const http = require('http');
+  const s3Store = new Map();
+  let s3Fail = false;
+  const lastGets = [];
+  const s3Server = http.createServer((q, res) => {
+    const u = new URL(q.url, 'http://x');
+    if (q.method === 'PUT') {
+      const chunks = [];
+      q.on('data', (c) => chunks.push(c));
+      q.on('end', () => {
+        if (s3Fail) { res.writeHead(500); return res.end('<Error><Code>InternalError</Code></Error>'); }
+        s3Store.set(decodeURIComponent(u.pathname), { body: Buffer.concat(chunks), contentType: q.headers['content-type'] });
+        res.writeHead(200, { ETag: '"etag"' }); res.end();
+      });
+      return;
+    }
+    const obj = s3Store.get(decodeURIComponent(u.pathname));
+    lastGets.push(u);
+    if (q.method !== 'GET' || !obj) { res.writeHead(404); return res.end(); }
+    res.writeHead(200, { 'Content-Type': u.searchParams.get('response-content-type') || obj.contentType, 'Content-Disposition': u.searchParams.get('response-content-disposition') || '' });
+    res.end(obj.body);
+  });
+  await new Promise((resolve) => s3Server.listen(0, '127.0.0.1', resolve));
+
+  const PDF_BYTES = Buffer.concat([Buffer.from('%PDF-1.4\n'), Buffer.alloc(2000, 0x20), Buffer.from('\n%%EOF')]);
+  const PNG_BYTES = Buffer.concat([Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]), Buffer.alloc(100, 1)]);
+  const JPG_BYTES = Buffer.concat([Buffer.from([0xff, 0xd8, 0xff, 0xe0]), Buffer.alloc(100, 2)]);
+  const upload = async (orderId, tokn, { kind, file, name = 'file.pdf', extra } = {}) => {
+    const form = new FormData();
+    if (kind !== undefined) form.append('kind', kind);
+    if (file) form.append('file', new Blob([file]), name);
+    if (extra) extra(form);
+    const r = await fetch(`${BASE}/orders/${orderId}/documents`, { method: 'POST', headers: tokn ? { Authorization: 'Bearer ' + tokn } : {}, body: form });
+    let data = null; try { data = await r.json(); } catch (e) {}
+    return { status: r.status, data };
+  };
+  const docRows = (orderId) => db.orderDocument.count({ where: { orderId } });
+
+  let dso = await makeOrder(90, S2, 'sup2');
+  r = await upload(dso.order.id, S2, { kind: 'DELIVERY_NOTE', file: PDF_BYTES });
+  check('storage not configured -> 503, nothing stored', r.status === 503 && (await docRows(dso.order.id)) === 0, r.data);
+  Object.assign(process.env, { S3_ENDPOINT: `http://127.0.0.1:${s3Server.address().port}`, S3_REGION: 'auto', S3_BUCKET: 'test-bucket',
+    S3_ACCESS_KEY_ID: 'test-key', S3_SECRET_ACCESS_KEY: 'test-secret', S3_FORCE_PATH_STYLE: 'true' });
+
+  r = await upload(dso.order.id, S2, { kind: 'DELIVERY_NOTE', file: PDF_BYTES, name: 'Delivery note 0042.pdf' });
+  const dn = r.data;
+  const dnRow = dn && await db.orderDocument.findUnique({ where: { id: dn.id } });
+  const dnObj = dnRow && s3Store.get('/test-bucket/' + dnRow.storageKey);
+  check('supplier uploads delivery note PDF_BYTES -> 201', r.status === 201 && dn.kind === 'DELIVERY_NOTE' && dn.fileName === 'Delivery note 0042.pdf' && dn.contentType === 'application/pdf' && dn.sizeBytes === PDF_BYTES.length, r.data);
+  check('...response has no storage key', dn && !('storageKey' in dn));
+  check('...object stored under orders/<orderId>/<uuid> with exact bytes and type', !!dnObj && /^orders\/[0-9a-f-]+\/[0-9a-f-]{36}$/.test(dnRow.storageKey) && dnRow.storageKey.startsWith('orders/' + dso.order.id + '/') &&
+    dnObj.body.equals(PDF_BYTES) && dnObj.contentType === 'application/pdf', dnRow && dnRow.storageKey);
+  await settle();
+  check('...buyer notified', (await notesOf('buyer1', 'DOCUMENT_ADDED', dso.order.id)).some((n) => n.title === 'New delivery note on your order' && n.body === 'Co sup2 added "Delivery note 0042.pdf".'));
+
+  check('buyer cannot add a delivery note -> 403', (await upload(dso.order.id, B1, { kind: 'DELIVERY_NOTE', file: PDF_BYTES })).status === 403);
+  check('buyer cannot add an invoice -> 403', (await upload(dso.order.id, B1, { kind: 'INVOICE', file: PDF_BYTES })).status === 403);
+  r = await upload(dso.order.id, B1, { kind: 'OTHER', file: PNG_BYTES, name: 'damage photo.png' });
+  check('buyer adds another document (PNG_BYTES) -> 201', r.status === 201 && r.data.contentType === 'image/png' && r.data.uploadedByCompany.name === 'Co buyer1', r.data);
+  const buyerDocId = r.data.id;
+  check('supplier adds an invoice -> 201', (await upload(dso.order.id, S2, { kind: 'INVOICE', file: PDF_BYTES, name: 'INV-7.pdf' })).status === 201);
+  const rowsNow = await docRows(dso.order.id);
+  check('bad kind -> 400', (await upload(dso.order.id, S2, { kind: 'RECEIPT', file: PDF_BYTES })).status === 400);
+  check('missing kind -> 400', (await upload(dso.order.id, S2, { file: PDF_BYTES })).status === 400);
+  check('no file -> 400', (await upload(dso.order.id, S2, { kind: 'OTHER' })).status === 400);
+  check('empty file -> 400', (await upload(dso.order.id, S2, { kind: 'OTHER', file: Buffer.alloc(0) })).status === 400);
+  r = await upload(dso.order.id, S2, { kind: 'OTHER', file: Buffer.from('hello, not a pdf'), name: 'fake.pdf' });
+  check('text renamed .pdf -> 415', r.status === 415 && /PDF, JPEG, PNG or WebP/.test(r.data.error), r.data);
+  check('SVG -> 415', (await upload(dso.order.id, S2, { kind: 'OTHER', file: Buffer.from('<svg xmlns="http://www.w3.org/2000/svg"><script>alert(1)</script></svg>'), name: 'x.svg' })).status === 415);
+  check('HTML renamed .png -> 415', (await upload(dso.order.id, S2, { kind: 'OTHER', file: Buffer.from('<html><script>alert(1)</script></html>'), name: 'x.png' })).status === 415);
+  r = await upload(dso.order.id, S2, { kind: 'OTHER', file: Buffer.alloc(10 * 1024 * 1024 + 1, 0x25), name: 'big.pdf' });
+  check('file over 10 MB -> 413', r.status === 413 && /at most 10 MB/.test(r.data.error), r.data);
+  check('two files in one request -> 400', (await upload(dso.order.id, S2, { kind: 'OTHER', file: PDF_BYTES, extra: (f) => f.append('file', new Blob([PDF_BYTES]), 'b.pdf') })).status === 400);
+  check('JSON instead of multipart -> 400', (await call('POST', `/orders/${dso.order.id}/documents`, S2, { kind: 'OTHER' })).status === 400);
+  check('...rejected uploads stored nothing', (await docRows(dso.order.id)) === rowsNow && s3Store.size === rowsNow);
+  r = await upload(dso.order.id, S2, { kind: 'OTHER', file: JPG_BYTES, name: 'photo' });
+  check('JPEG without extension -> name gets .jpg', r.status === 201 && r.data.fileName === 'photo.jpg', r.data);
+  r = await upload(dso.order.id, S2, { kind: 'OTHER', file: PDF_BYTES, name: '..\\..\\etc/passwd.pdf' });
+  check('path in file name is dropped', r.status === 201 && r.data.fileName === 'passwd.pdf', r.data);
+  check('outsider supplier / other buyer -> 403', (await upload(dso.order.id, S1, { kind: 'OTHER', file: PDF_BYTES })).status === 403 && (await upload(dso.order.id, B2, { kind: 'OTHER', file: PDF_BYTES })).status === 403);
+  check('admin cannot upload -> 403', (await upload(dso.order.id, ADM, { kind: 'OTHER', file: PDF_BYTES })).status === 403);
+  check('unknown order -> 404', (await upload('00000000-0000-0000-0000-000000000000', S2, { kind: 'OTHER', file: PDF_BYTES })).status === 404);
+  s3Fail = true;
+  const before502 = await docRows(dso.order.id);
+  r = await upload(dso.order.id, S2, { kind: 'OTHER', file: PDF_BYTES });
+  s3Fail = false;
+  check('storage failure -> 502, no row', r.status === 502 && /try again/.test(r.data.error) && (await docRows(dso.order.id)) === before502, r.data);
+
+  // list
+  r = await call('GET', `/orders/${dso.order.id}/documents`, B1);
+  check('buyer lists documents (oldest first, no storage keys)', r.status === 200 && r.data.length === 5 && r.data[0].id === dn.id && r.data.every((x) => !('storageKey' in x)), r.data && r.data.map((x) => x.fileName));
+  check('supplier and admin can list', (await call('GET', `/orders/${dso.order.id}/documents`, S2)).data.length === 5 && (await call('GET', `/orders/${dso.order.id}/documents`, ADM)).data.length === 5);
+  check('outsider cannot list -> 403', (await call('GET', `/orders/${dso.order.id}/documents`, S1)).status === 403 && (await call('GET', `/orders/${dso.order.id}/documents`, B2)).status === 403);
+
+  // download: presigned for 120 s, as an attachment under the original name
+  r = await call('GET', `/documents/${dn.id}/download`, B1);
+  const dl = r.status === 200 && new URL(r.data.url);
+  check('buyer gets a presigned URL for 120 s', r.status === 200 && r.data.expiresIn === 120 && dl.searchParams.get('X-Amz-Expires') === '120' && !!dl.searchParams.get('X-Amz-Signature') &&
+    dl.pathname === '/test-bucket/' + dnRow.storageKey, r.data);
+  check('...downloads as an attachment with the original name', /^attachment; filename="Delivery note 0042\.pdf"; filename\*=UTF-8''Delivery%20note%200042\.pdf$/.test(dl.searchParams.get('response-content-disposition') || ''), dl && dl.searchParams.get('response-content-disposition'));
+  const got = await fetch(r.data.url);
+  check('...URL serves the file', got.status === 200 && Buffer.from(await got.arrayBuffer()).equals(PDF_BYTES) && got.headers.get('content-type') === 'application/pdf');
+  check('supplier and admin can download', (await call('GET', `/documents/${dn.id}/download`, S2)).status === 200 && (await call('GET', `/documents/${dn.id}/download`, ADM)).status === 200);
+  check('outsider cannot download -> 403', (await call('GET', `/documents/${dn.id}/download`, S1)).status === 403 && (await call('GET', `/documents/${dn.id}/download`, B2)).status === 403);
+  check('unknown document -> 404', (await call('GET', '/documents/00000000-0000-0000-0000-000000000000/download', B1)).status === 404);
+  r = await upload(dso.order.id, B1, { kind: 'OTHER', file: PDF_BYTES, name: 'Счёт №5.pdf' });
+  const uni = new URL((await call('GET', `/documents/${r.data.id}/download`, B1)).data.url).searchParams.get('response-content-disposition');
+  check('non-ASCII name: ASCII fallback + UTF-8 name', uni === `attachment; filename="____ _5.pdf"; filename*=UTF-8''${encodeURIComponent('Счёт №5.pdf')}`, uni);
+
+  // delete: only the uploader, while the order is open; the stored file is kept
+  check('buyer cannot delete the supplier\'s document -> 403', (await call('DELETE', `/documents/${dn.id}`, B1)).status === 403);
+  check('admin cannot delete -> 403', (await call('DELETE', `/documents/${dn.id}`, ADM)).status === 403);
+  check('supplier deletes own document -> 200', (await call('DELETE', `/documents/${dn.id}`, S2)).status === 200);
+  check('...hidden from the list, download 404', !(await call('GET', `/orders/${dso.order.id}/documents`, B1)).data.some((x) => x.id === dn.id) && (await call('GET', `/documents/${dn.id}/download`, B1)).status === 404);
+  check('...row soft-deleted, stored file kept', !!(await db.orderDocument.findUnique({ where: { id: dn.id } })).deletedAt && s3Store.has('/test-bucket/' + dnRow.storageKey));
+  check('delete again -> 404', (await call('DELETE', `/documents/${dn.id}`, S2)).status === 404);
+  await db.order.update({ where: { id: dso.order.id }, data: { status: 'COMPLETED' } });
+  check('delete on a COMPLETED order -> 400', (await call('DELETE', `/documents/${buyerDocId}`, B1)).status === 400);
+  check('upload to a COMPLETED order still allowed -> 201', (await upload(dso.order.id, S2, { kind: 'INVOICE', file: PDF_BYTES })).status === 201);
+  await db.order.update({ where: { id: dso.order.id }, data: { status: 'CANCELLED' } });
+  check('upload to a CANCELLED order -> 400', (await upload(dso.order.id, S2, { kind: 'OTHER', file: PDF_BYTES })).status === 400);
+  check('...its documents stay readable', (await call('GET', `/documents/${buyerDocId}/download`, S2)).status === 200);
+
+  // at most 50 live documents per order
+  dso = await makeOrder(10, S2, 'sup2');
+  await db.orderDocument.createMany({ data: Array.from({ length: 50 }, (_, i) => ({ orderId: dso.order.id, kind: 'OTHER', fileName: `f${i}.pdf`, contentType: 'application/pdf', sizeBytes: 1, storageKey: `seed/${dso.order.id}/${i}`, uploadedByCompanyId: 'sup2' })) });
+  r = await upload(dso.order.id, B1, { kind: 'OTHER', file: PDF_BYTES });
+  check('51st document -> 400', r.status === 400 && /at most 50/.test(r.data.error), r.data);
+  check('DB rejects kind outside the list (CHECK)', await db.orderDocument.create({ data: { orderId: dso.order.id, kind: 'CONTRACT', fileName: 'x', contentType: 'application/pdf', sizeBytes: 1, storageKey: 'seed/x', uploadedByCompanyId: 'sup2' } }).then(() => false, () => true));
+  s3Server.close();
+
   console.log('\n== 18d. L6 change-password attempts limited per user ==');
   await mkCo('sup11', 'SUPPLIER', 0); await mkCo('sup12', 'SUPPLIER', 0);
   const T11 = (await call('POST', '/auth/login', null, { email: 'sup11@t.test', password: 'pw123456' }, undefined, { 'X-Forwarded-For': '192.0.2.11, 10.0.0.1' })).data.token;
