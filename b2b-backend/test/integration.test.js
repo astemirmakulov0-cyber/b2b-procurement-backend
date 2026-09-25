@@ -1588,6 +1588,35 @@ async function newRfq(budget = 500, extra = {}) {
   r = await call('POST', `/rfqs/${legacyNoQty.id}/quotes`, S3, { unitPrice: 3 });
   check('quote on an RFQ without quantity -> 400, no fee', r.status === 400 && /no quantity/.test(r.data.error) && (await bal('sup3')) === 100, r.data);
 
+  console.log('\n== 18c11. stage 3: catalog only from verified suppliers ==');
+  await mkCo('cat1', 'SUPPLIER');
+  const C1 = tok('SUPPLIER', 'cat1');
+  const setCat1 = (data) => db.company.update({ where: { id: 'cat1' }, data });
+  const seenBy = async (tokn, name) => (await call('GET', '/catalog', tokn)).data.some((i) => i.name === name);
+  await setCat1({ verificationStatus: 'PENDING' });
+  r = await call('POST', '/catalog', C1, { name: 'cat1 pending item', price: 3 });
+  check('unverified supplier cannot add an item -> 403 "Available after verification"', r.status === 403 && /Available after verification/.test(r.data.error) && (await db.catalogItem.count({ where: { name: 'cat1 pending item' } })) === 0, r.data);
+  await setCat1({ verificationStatus: 'VERIFIED' });
+  r = await call('POST', '/catalog', C1, { name: 'cat1 item', price: 3 });
+  const cat1Item = r.data;
+  check('verified supplier adds an item -> 201, visible to buyers', r.status === 201 && await seenBy(B1, 'cat1 item') && await seenBy(S1, 'cat1 item'));
+  for (const st of ['PENDING', 'IN_REVIEW', 'REJECTED']) {
+    await setCat1({ verificationStatus: st });
+    check(`supplier ${st}: its items hidden from buyers and other suppliers, still shown to itself`,
+      !(await seenBy(B1, 'cat1 item')) && !(await seenBy(S1, 'cat1 item')) && await seenBy(C1, 'cat1 item') &&
+      !(await call('GET', '/catalog?supplierCompanyId=cat1', B1)).data.length && (await call('GET', '/catalog?supplierCompanyId=cat1', C1)).data.length === 1);
+  }
+  check('unverified supplier cannot edit its item -> 403', (await call('PATCH', `/catalog/${cat1Item.id}`, C1, { price: 4 })).status === 403);
+  await setCat1({ verificationStatus: 'VERIFIED' });
+  check('verified again: visible, editable', await seenBy(B1, 'cat1 item') && (await call('PATCH', `/catalog/${cat1Item.id}`, C1, { price: 4 })).status === 200);
+  await db.user.update({ where: { id: 'u-cat1' }, data: { isActive: false } });
+  check('deactivated account: items hidden', !(await seenBy(B1, 'cat1 item')));
+  await db.user.update({ where: { id: 'u-cat1' }, data: { isActive: true } });
+  await setCat1({ isActive: false });
+  check('deactivated company: items hidden', !(await seenBy(B1, 'cat1 item')));
+  await setCat1({ isActive: true, verificationStatus: 'PENDING' });
+  check('unverified supplier can still delete its own item', (await call('DELETE', `/catalog/${cat1Item.id}`, C1)).status === 204);
+
   console.log('\n== 18d. L6 change-password attempts limited per user ==');
   await mkCo('sup11', 'SUPPLIER', 0); await mkCo('sup12', 'SUPPLIER', 0);
   const T11 = (await call('POST', '/auth/login', null, { email: 'sup11@t.test', password: 'pw123456' }, undefined, { 'X-Forwarded-For': '192.0.2.11, 10.0.0.1' })).data.token;
