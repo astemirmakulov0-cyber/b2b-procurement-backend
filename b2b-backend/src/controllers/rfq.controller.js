@@ -8,6 +8,16 @@ const BUDGET_REQUIRED = 'budget is required to publish an RFQ (suppliers pay 5% 
 const QUANTITY_REQUIRED = 'quantity (a whole number, at least 1) is required to publish an RFQ (quotes are priced per unit)';
 const validQuantity = (q) => Number.isInteger(q) && q >= 1;
 const CATEGORY_REQUIRED = 'category is required to publish an RFQ';
+const MAX_SPECIFICATIONS = 2000;
+// { value } — trimmed text, or null for empty — or { error }; undefined when the field wasn't sent
+function parseSpecifications(raw) {
+  if (raw === undefined) return { value: undefined };
+  if (raw === null) return { value: null };
+  if (typeof raw !== 'string') return { error: 'specifications must be text' };
+  const text = raw.trim();
+  if (text.length > MAX_SPECIFICATIONS) return { error: `specifications must be at most ${MAX_SPECIFICATIONS} characters` };
+  return { value: text || null };
+}
 
 // Returns { date } for a valid future deadline, { error } otherwise
 function parseDeadline(value) {
@@ -25,6 +35,8 @@ const createRFQ = asyncHandler(async (req, res) => {
   }
 
   const { title, description, quantity, unit, deadline, publish } = req.body;
+  const specs = parseSpecifications(req.body.specifications);
+  if (specs.error) return res.status(400).json({ error: specs.error });
   // only active categories (others are "coming soon"); earlier names are mapped to the current one
   let category;
   if (req.body.category !== undefined && req.body.category !== null && req.body.category !== '') {
@@ -60,6 +72,7 @@ const createRFQ = asyncHandler(async (req, res) => {
       quantity,
       unit,
       budget,
+      specifications: specs.value || null,
       deadline: deadlineDate,
       status: publish ? 'PUBLISHED' : 'DRAFT',
     },
@@ -154,7 +167,7 @@ const BUYER_STATUS_TRANSITIONS = {
   AWARDED: [],
   CANCELLED: [],
 };
-const CONTENT_FIELDS = ['title', 'description', 'category', 'quantity', 'unit', 'deadline', 'budget'];
+const CONTENT_FIELDS = ['title', 'description', 'category', 'quantity', 'unit', 'deadline', 'budget', 'specifications'];
 
 // PATCH /api/rfqs/:id  (buyer, owner only) - edit content (before any quotes), or publish/close
 const updateRFQ = asyncHandler(async (req, res) => {
@@ -180,6 +193,8 @@ const updateRFQ = asyncHandler(async (req, res) => {
     if (checked.error) return res.status(400).json({ error: checked.error });
     category = checked.value;
   }
+  const specs = parseSpecifications(req.body.specifications);
+  if (specs.error) return res.status(400).json({ error: specs.error });
 
   const result = await prisma.$transaction(async (tx) => {
     // Lock the row so a concurrent quote submission or award can't slip between the checks and the update
@@ -228,6 +243,7 @@ const updateRFQ = asyncHandler(async (req, res) => {
       where: { id: existing.id },
       data: {
         title, description, category, quantity, unit, budget,
+        specifications: specs.value,
         deadline: deadlineDate,
         status,
       },
