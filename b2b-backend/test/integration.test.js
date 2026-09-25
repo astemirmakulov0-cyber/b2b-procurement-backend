@@ -976,7 +976,7 @@ async function newRfq(budget = 500, extra = {}) {
       q.on('data', (c) => chunks.push(c));
       q.on('end', () => {
         if (s3Fail) { res.writeHead(500); return res.end('<Error><Code>InternalError</Code></Error>'); }
-        s3Store.set(decodeURIComponent(u.pathname), { body: Buffer.concat(chunks), contentType: q.headers['content-type'] });
+        s3Store.set(decodeURIComponent(u.pathname), { body: Buffer.concat(chunks), contentType: q.headers['content-type'], headers: q.headers });
         res.writeHead(200, { ETag: '"etag"' }); res.end();
       });
       return;
@@ -1015,6 +1015,7 @@ async function newRfq(budget = 500, extra = {}) {
   const dnObj = dnRow && s3Store.get('/test-bucket/' + dnRow.storageKey);
   check('supplier uploads delivery note PDF_BYTES -> 201', r.status === 201 && dn.kind === 'DELIVERY_NOTE' && dn.fileName === 'Delivery note 0042.pdf' && dn.contentType === 'application/pdf' && dn.sizeBytes === PDF_BYTES.length, r.data);
   check('...response has no storage key', dn && !('storageKey' in dn));
+  check('...PUT without optional checksum headers', !!dnObj && !Object.keys(dnObj.headers).some((h) => /^x-amz-(checksum-|sdk-checksum)/.test(h)), dnObj && Object.keys(dnObj.headers));
   check('...object stored under orders/<orderId>/<uuid> with exact bytes and type', !!dnObj && /^orders\/[0-9a-f-]+\/[0-9a-f-]{36}$/.test(dnRow.storageKey) && dnRow.storageKey.startsWith('orders/' + dso.order.id + '/') &&
     dnObj.body.equals(PDF_BYTES) && dnObj.contentType === 'application/pdf', dnRow && dnRow.storageKey);
   await settle();
@@ -1063,7 +1064,7 @@ async function newRfq(budget = 500, extra = {}) {
   r = await call('GET', `/documents/${dn.id}/download`, B1);
   const dl = r.status === 200 && new URL(r.data.url);
   check('buyer gets a presigned URL for 120 s', r.status === 200 && r.data.expiresIn === 120 && dl.searchParams.get('X-Amz-Expires') === '120' && !!dl.searchParams.get('X-Amz-Signature') &&
-    dl.pathname === '/test-bucket/' + dnRow.storageKey, r.data);
+    dl.pathname === '/test-bucket/' + dnRow.storageKey && !dl.searchParams.has('x-amz-checksum-mode'), r.data);
   check('...downloads as an attachment with the original name', /^attachment; filename="Delivery note 0042\.pdf"; filename\*=UTF-8''Delivery%20note%200042\.pdf$/.test(dl.searchParams.get('response-content-disposition') || ''), dl && dl.searchParams.get('response-content-disposition'));
   const got = await fetch(r.data.url);
   check('...URL serves the file', got.status === 200 && Buffer.from(await got.arrayBuffer()).equals(PDF_BYTES) && got.headers.get('content-type') === 'application/pdf');

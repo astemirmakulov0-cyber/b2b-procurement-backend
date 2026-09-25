@@ -29,7 +29,12 @@ function s3() {
   if (!client) {
     const c = config();
     if (!c) throw Object.assign(new Error('File storage is not configured'), { status: 503 });
-    client = new S3Client({ endpoint: c.endpoint, region: c.region, credentials: c.credentials, forcePathStyle: c.forcePathStyle });
+    client = new S3Client({
+      endpoint: c.endpoint, region: c.region, credentials: c.credentials, forcePathStyle: c.forcePathStyle,
+      // checksums only where the S3 API requires them: the SDK's default (added in 2025) sends extra checksum
+      // headers/parameters that S3-compatible stores don't all support
+      requestChecksumCalculation: 'WHEN_REQUIRED', responseChecksumValidation: 'WHEN_REQUIRED',
+    });
   }
   return client;
 }
