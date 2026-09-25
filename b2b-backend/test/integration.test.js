@@ -612,6 +612,7 @@ async function newRfq(budget = 500, extra = {}) {
   const nq = (await call('POST', '/rfqs', B1, { title: 'Office desks', description: 'x', budget: 100, deadline: future(), publish: true })).data;
   const notesBefore = await db.notification.count({ where: { companyId: 'buyer1', type: 'NEW_QUOTE' } });
   check('supplier quotes -> 201', (await call('POST', `/rfqs/${nq.id}/quotes`, S2, { price: 64.5 })).status === 201);
+  await new Promise((res) => setTimeout(res, 150)); // notify() runs right after the response
   const nqNote = await db.notification.findFirst({ where: { companyId: 'buyer1', type: 'NEW_QUOTE' }, orderBy: { createdAt: 'desc' } });
   check('buyer notified of the new quote (amount + RFQ title, no supplier name)', nqNote && nqNote.body.includes('64.500 BHD') && nqNote.body.includes('Office desks') && !nqNote.body.includes('Co sup2'), nqNote && nqNote.body);
   check('rejected duplicate quote sends no notification', (await call('POST', `/rfqs/${nq.id}/quotes`, S2, { price: 60 })).status === 409 &&
