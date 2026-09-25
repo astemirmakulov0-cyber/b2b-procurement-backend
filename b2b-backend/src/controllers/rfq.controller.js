@@ -2,10 +2,12 @@ const prisma = require('../config/prisma');
 const asyncHandler = require('../utils/asyncHandler');
 const { CANCELLABLE_STATUSES, cancelRfqInTx } = require('../utils/rfqCancel');
 const { parseAmount } = require('../utils/money');
+const { checkCategory } = require('../utils/categories');
 
 const BUDGET_REQUIRED = 'budget is required to publish an RFQ (suppliers pay 5% of it to submit a quote)';
 const QUANTITY_REQUIRED = 'quantity (a whole number, at least 1) is required to publish an RFQ (quotes are priced per unit)';
 const validQuantity = (q) => Number.isInteger(q) && q >= 1;
+const CATEGORY_REQUIRED = 'category is required to publish an RFQ';
 
 // Returns { date } for a valid future deadline, { error } otherwise
 function parseDeadline(value) {
@@ -22,7 +24,14 @@ const createRFQ = asyncHandler(async (req, res) => {
     return res.status(403).json({ error: 'Your company must be verified before posting RFQs' });
   }
 
-  const { title, description, category, quantity, unit, deadline, publish } = req.body;
+  const { title, description, quantity, unit, deadline, publish } = req.body;
+  // only active categories (others are "coming soon"); earlier names are mapped to the current one
+  let category;
+  if (req.body.category !== undefined && req.body.category !== null && req.body.category !== '') {
+    const checked = checkCategory(req.body.category);
+    if (checked.error) return res.status(400).json({ error: checked.error });
+    category = checked.value;
+  }
   if (!title || !description) return res.status(400).json({ error: 'title and description required' });
   let budget = null;
   if (req.body.budget !== undefined && req.body.budget !== null) {
@@ -34,6 +43,7 @@ const createRFQ = asyncHandler(async (req, res) => {
   if (publish && budget === null) return res.status(400).json({ error: BUDGET_REQUIRED });
   // quotes are priced per unit (total = unit price × quantity), so a published RFQ needs a quantity
   if (publish && !validQuantity(quantity)) return res.status(400).json({ error: QUANTITY_REQUIRED });
+  if (publish && !category) return res.status(400).json({ error: CATEGORY_REQUIRED });
   let deadlineDate = null;
   if (deadline) {
     const parsed = parseDeadline(deadline);
@@ -164,6 +174,13 @@ const updateRFQ = asyncHandler(async (req, res) => {
     budget = parsed.value;
   }
 
+  let category;
+  if (req.body.category !== undefined && req.body.category !== null && req.body.category !== '') {
+    const checked = checkCategory(req.body.category);
+    if (checked.error) return res.status(400).json({ error: checked.error });
+    category = checked.value;
+  }
+
   const result = await prisma.$transaction(async (tx) => {
     // Lock the row so a concurrent quote submission or award can't slip between the checks and the update
     await tx.$queryRaw`SELECT id FROM "RFQ" WHERE id = ${req.params.id} FOR UPDATE`;
@@ -185,6 +202,12 @@ const updateRFQ = asyncHandler(async (req, res) => {
       if (status === 'PUBLISHED' && !validQuantity(req.body.quantity !== undefined ? req.body.quantity : existing.quantity)) {
         return { status: 400, error: QUANTITY_REQUIRED };
       }
+      if (status === 'PUBLISHED' && !category) {
+        if (!existing.category) return { status: 400, error: CATEGORY_REQUIRED };
+        const stored = checkCategory(existing.category);
+        if (stored.error) return { status: 400, error: stored.error };
+        category = stored.value;
+      }
     }
 
     // Suppliers pay to quote against the RFQ as it was published, so its content is frozen once quotes exist
@@ -200,7 +223,7 @@ const updateRFQ = asyncHandler(async (req, res) => {
       }
     }
 
-    const { title, description, category, quantity, unit } = req.body;
+    const { title, description, quantity, unit } = req.body;
     const rfq = await tx.rFQ.update({
       where: { id: existing.id },
       data: {
