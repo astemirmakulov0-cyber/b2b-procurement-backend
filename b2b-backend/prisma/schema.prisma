@@ -141,7 +141,12 @@ model CompanyDocument {
   id        String   @id @default(uuid())
   companyId String
   company   Company  @relation(fields: [companyId], references: [id])
-  fileUrl   String
+  // legacy: the file inline as a data: URL; cleared once it is verified in the bucket (scripts/migrate-files-to-bucket.js)
+  fileUrl   String?
+  // the file in the private storage bucket (new uploads; migrated ones). CHECK: fileUrl or storageKey is set
+  storageKey  String?  @unique
+  contentType String?
+  sizeBytes   Int?
   docType   String
   uploadedAt DateTime @default(now())
 
@@ -234,7 +239,11 @@ model CatalogItem {
   price             Decimal  @db.Decimal(12, 3)
   unit              String?
   category          String?
+  // legacy: the photo inline as a data: URL (cleared once migrated and verified in the bucket)
   imageUrl          String?
+  // the photo in the private storage bucket; served as a presigned URL in imageUrl
+  imageKey          String?  @unique
+  imageContentType  String?
   isActive          Boolean  @default(true)
   createdAt         DateTime @default(now())
   updatedAt         DateTime @updatedAt

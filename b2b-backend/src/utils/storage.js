@@ -6,7 +6,7 @@
 //   S3_ENDPOINT, S3_REGION, S3_BUCKET, S3_ACCESS_KEY_ID, S3_SECRET_ACCESS_KEY
 //   S3_FORCE_PATH_STYLE=true only for endpoints without virtual-hosted buckets (the local test server)
 const crypto = require('crypto');
-const { S3Client, PutObjectCommand, GetObjectCommand } = require('@aws-sdk/client-s3');
+const { S3Client, PutObjectCommand, GetObjectCommand, HeadObjectCommand } = require('@aws-sdk/client-s3');
 const { getSignedUrl } = require('@aws-sdk/s3-request-presigner');
 
 const DOWNLOAD_URL_TTL_SECONDS = 120;
@@ -62,4 +62,36 @@ async function presignDownload(key, fileName, contentType) {
   return getSignedUrl(s3(), cmd, { expiresIn: DOWNLOAD_URL_TTL_SECONDS });
 }
 
-module.exports = { isConfigured, newKey, putObject, presignDownload, attachmentDisposition, DOWNLOAD_URL_TTL_SECONDS };
+// A URL that shows the object in the page (iframe / img) for the next 120 seconds — for PDFs and raster
+// images only, which is all the upload checks let in
+async function presignView(key, contentType) {
+  const cmd = new GetObjectCommand({ Bucket: config().bucket, Key: key, ResponseContentDisposition: 'inline', ResponseContentType: contentType });
+  return getSignedUrl(s3(), cmd, { expiresIn: DOWNLOAD_URL_TTL_SECONDS });
+}
+
+// Catalog photos: signed as of the start of the current hour and valid for 2 hours, so the URL stays the
+// same within the hour (the browser caches the image, the catalog list doesn't change on every refresh)
+// and is valid for at least an hour after it was handed out.
+const STABLE_URL_WINDOW_MS = 60 * 60 * 1000;
+const STABLE_URL_TTL_SECONDS = 2 * 60 * 60;
+async function presignStable(key, contentType, now = Date.now()) {
+  const cmd = new GetObjectCommand({ Bucket: config().bucket, Key: key, ResponseContentType: contentType });
+  const signingDate = new Date(Math.floor(now / STABLE_URL_WINDOW_MS) * STABLE_URL_WINDOW_MS);
+  return getSignedUrl(s3(), cmd, { expiresIn: STABLE_URL_TTL_SECONDS, signingDate });
+}
+
+// { size } of a stored object, or null if it doesn't exist
+async function headObject(key) {
+  try {
+    const r = await s3().send(new HeadObjectCommand({ Bucket: config().bucket, Key: key }));
+    return { size: r.ContentLength };
+  } catch (err) {
+    if (err.name === 'NotFound' || err.$metadata?.httpStatusCode === 404) return null;
+    throw err;
+  }
+}
+
+module.exports = {
+  isConfigured, newKey, putObject, presignDownload, presignView, presignStable, headObject, attachmentDisposition,
+  DOWNLOAD_URL_TTL_SECONDS, STABLE_URL_TTL_SECONDS,
+};
