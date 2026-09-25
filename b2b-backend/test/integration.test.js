@@ -1375,6 +1375,177 @@ async function newRfq(budget = 500, extra = {}) {
   check('cached: new supplier not visible yet', (await getStats()).data.suppliers === s0.suppliers);
   check('after the cache expires: +1', (await fresh()).suppliers === s0.suppliers + 1);
 
+  console.log('\n== 18c9. bucket backup (cron job) and restore ==');
+  const nodeCrypto = require('crypto');
+  const zlib = require('zlib');
+  // S3 stand-in with listing (paged), copy and delete; several buckets by name (path-style)
+  function makeFakeS3({ pageSize = 1000, etagMode = 'md5' } = {}) {
+    const buckets = new Map();
+    const failGet = new Set();
+    const bucket = (n) => { if (!buckets.has(n)) buckets.set(n, new Map()); return buckets.get(n); };
+    const etagOf = (body) => { const h = nodeCrypto.createHash('md5').update(body).digest('hex'); return etagMode === 'md5' ? `"${h}"` : `"${h.slice(0, 16)}-other"`; };
+    const x = (s) => String(s).replace(/[<>&'"]/g, (c) => ({ '<': '&lt;', '>': '&gt;', '&': '&amp;', "'": '&apos;', '"': '&quot;' }[c]));
+    const put = (b, key, body, contentType, meta = {}) => bucket(b).set(key, { body, contentType, meta, etag: etagOf(body) });
+    const server = http.createServer((q, res) => {
+      const u = new URL(q.url, 'http://x');
+      const parts = u.pathname.split('/').slice(1);
+      const b = decodeURIComponent(parts.shift());
+      const key = parts.map(decodeURIComponent).join('/');
+      const store = bucket(b);
+      const chunks = [];
+      q.on('data', (c) => chunks.push(c));
+      q.on('end', () => {
+        if (q.method === 'GET' && !key) {
+          const prefix = u.searchParams.get('prefix') || '';
+          const start = Number(u.searchParams.get('continuation-token') || 0);
+          const keys = [...store.keys()].filter((k) => k.startsWith(prefix)).sort();
+          const page = keys.slice(start, start + pageSize);
+          const truncated = start + pageSize < keys.length;
+          res.writeHead(200, { 'Content-Type': 'application/xml' });
+          return res.end(`<?xml version="1.0" encoding="UTF-8"?><ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/"><Name>${x(b)}</Name><Prefix>${x(prefix)}</Prefix><KeyCount>${page.length}</KeyCount><MaxKeys>${pageSize}</MaxKeys><IsTruncated>${truncated}</IsTruncated>` +
+            page.map((k) => `<Contents><Key>${x(k)}</Key><LastModified>2026-09-25T00:00:00.000Z</LastModified><ETag>${x(store.get(k).etag)}</ETag><Size>${store.get(k).body.length}</Size><StorageClass>STANDARD</StorageClass></Contents>`).join('') +
+            (truncated ? `<NextContinuationToken>${start + pageSize}</NextContinuationToken>` : '') + '</ListBucketResult>');
+        }
+        if (q.method === 'PUT' && q.headers['x-amz-copy-source']) {
+          const src = decodeURIComponent(q.headers['x-amz-copy-source']).replace(/^\//, '');
+          const i = src.indexOf('/');
+          const obj = bucket(src.slice(0, i)).get(src.slice(i + 1));
+          if (!obj) { res.writeHead(404); return res.end(); }
+          store.set(key, { ...obj });
+          res.writeHead(200, { 'Content-Type': 'application/xml' });
+          return res.end(`<?xml version="1.0" encoding="UTF-8"?><CopyObjectResult><ETag>${x(obj.etag)}</ETag><LastModified>2026-09-25T00:00:00.000Z</LastModified></CopyObjectResult>`);
+        }
+        if (q.method === 'PUT') {
+          const meta = Object.fromEntries(Object.entries(q.headers).filter(([h]) => h.startsWith('x-amz-meta-')).map(([h, v]) => [h.slice(11), v]));
+          put(b, key, Buffer.concat(chunks), q.headers['content-type'], meta);
+          res.writeHead(200, { ETag: store.get(key).etag });
+          return res.end();
+        }
+        if (q.method === 'DELETE') { store.delete(key); res.writeHead(204); return res.end(); }
+        const obj = store.get(key);
+        if (q.method === 'GET' && failGet.has(key)) { res.writeHead(500); return res.end(); }
+        if (!obj) { res.writeHead(404); return res.end(); }
+        res.writeHead(200, { ETag: obj.etag, 'Content-Length': obj.body.length, 'Content-Type': obj.contentType || 'application/octet-stream',
+          ...Object.fromEntries(Object.entries(obj.meta || {}).map(([k, v]) => ['x-amz-meta-' + k, v])) });
+        res.end(q.method === 'HEAD' ? undefined : obj.body);
+      });
+    });
+    return { server, bucket, put, failGet };
+  }
+  const mainS3 = makeFakeS3({ pageSize: 3 }); // small pages: listing must follow continuation tokens
+  const backupS3 = makeFakeS3({ pageSize: 3, etagMode: 'other' }); // another ETag scheme than the main bucket
+  // Sentry stand-in: collects events and cron check-ins from the envelopes the SDK posts
+  const sentryItems = [];
+  const sentryServer = http.createServer((q, res) => {
+    const chunks = [];
+    q.on('data', (c) => chunks.push(c));
+    q.on('end', () => {
+      let body = Buffer.concat(chunks);
+      if (q.headers['content-encoding'] === 'gzip') body = zlib.gunzipSync(body);
+      const lines = body.toString('utf8').split('\n');
+      for (let i = 1; i < lines.length - 1; i++) {
+        try { const h = JSON.parse(lines[i]); if (h.type) { sentryItems.push({ type: h.type, payload: JSON.parse(lines[i + 1]) }); i++; } } catch (e) {}
+      }
+      res.writeHead(200); res.end('{}');
+    });
+  });
+  for (const s of [mainS3.server, backupS3.server, sentryServer]) await new Promise((resolve) => s.listen(0, '127.0.0.1', resolve));
+  const BK_ENV = {
+    S3_ENDPOINT: `http://127.0.0.1:${mainS3.server.address().port}`, S3_REGION: 'auto', S3_BUCKET: 'files', S3_ACCESS_KEY_ID: 'k1', S3_SECRET_ACCESS_KEY: 's1', S3_FORCE_PATH_STYLE: 'true',
+    BACKUP_S3_ENDPOINT: `http://127.0.0.1:${backupS3.server.address().port}`, BACKUP_S3_REGION: 'auto', BACKUP_S3_BUCKET: 'files-backup', BACKUP_S3_ACCESS_KEY_ID: 'k2', BACKUP_S3_SECRET_ACCESS_KEY: 's2', BACKUP_S3_FORCE_PATH_STYLE: 'true',
+    SENTRY_DSN: `http://pub@127.0.0.1:${sentryServer.address().port}/1`,
+  };
+  const runBk = (script, args = [], extraEnv = {}) => new Promise((resolve) => execFile(process.execPath, [path.join(root, 'scripts', script), ...args],
+    { cwd: root, env: { ...process.env, ...BK_ENV, ...extraEnv } }, (err, stdout, stderr) => resolve({ code: err ? err.code : 0, out: stdout + stderr })));
+  const summaryOf = (out) => { const m = /Summary (\{.*\})/.exec(out); return m ? JSON.parse(m[1]) : null; };
+  const mainFiles = mainS3.bucket('files');
+  const bkFiles = backupS3.bucket('files-backup');
+  const current = () => [...bkFiles.keys()].filter((k) => !k.startsWith('_deleted/')).sort();
+  const trashKeys = () => [...bkFiles.keys()].filter((k) => k.startsWith('_deleted/')).sort();
+  const checkIns = () => sentryItems.filter((i) => i.type === 'check_in' && i.payload.monitor_slug === 'biddex-bucket-backup');
+  const events = () => sentryItems.filter((i) => i.type === 'event');
+  const todayUtc = new Date().toISOString().slice(0, 10);
+  const inDays = (n) => new Date(Date.now() + n * 86400e3).toISOString();
+  const fileBody = (s) => Buffer.from('%PDF-1.4 ' + s);
+  for (const [k, t] of [['orders/o1/a.pdf', 'application/pdf'], ['orders/o1/b.png', 'image/png'], ['quotes/q1/c.pdf', 'application/pdf'], ['catalog/s1/d.jpg', 'image/jpeg'], ['companies/c1/e.pdf', 'application/pdf']]) mainS3.put('files', k, fileBody(k), t);
+
+  r = await runBk('backup-bucket.js');
+  let sm = summaryOf(r.out);
+  check('backup: first run copies all 5 files (paged listing), exit 0', r.code === 0 && sm && sm.copied === 5 && JSON.stringify(current()) === JSON.stringify([...mainFiles.keys()].sort()), r.out);
+  const bo = bkFiles.get('orders/o1/b.png');
+  check('...same bytes and content type, main ETag kept in metadata', bo.body.equals(fileBody('orders/o1/b.png')) && bo.contentType === 'image/png' && bo.meta['source-etag'] === mainFiles.get('orders/o1/b.png').etag);
+  const ci1 = checkIns().map((c) => c.payload.status);
+  check('...Sentry cron monitor: in_progress then ok, with the schedule', JSON.stringify(ci1) === JSON.stringify(['in_progress', 'ok']) &&
+    checkIns()[0].payload.monitor_config.schedule.value === '0 23 * * *', checkIns().map((c) => c.payload));
+  r = await runBk('backup-bucket.js');
+  sm = summaryOf(r.out);
+  check('second run: nothing copied although the backup uses another ETag scheme', r.code === 0 && sm.copied === 0 && sm.unchanged === 5 && trashKeys().length === 0, r.out);
+  mainS3.put('files', 'orders/o2/f.pdf', fileBody('f'), 'application/pdf'); mainS3.put('files', 'orders/o2/g.pdf', fileBody('g'), 'application/pdf');
+  r = await runBk('backup-bucket.js');
+  check('new files: only the 2 new ones copied', summaryOf(r.out).copied === 2 && current().includes('orders/o2/g.pdf'), r.out);
+  mainS3.put('files', 'catalog/s1/d.jpg', Buffer.from('changed content'), 'image/jpeg');
+  r = await runBk('backup-bucket.js');
+  sm = summaryOf(r.out);
+  check('changed file: new version copied, previous one kept in _deleted/<today>/', sm.copied === 1 && sm.changed === 1 && bkFiles.get('catalog/s1/d.jpg').body.equals(Buffer.from('changed content')) &&
+    bkFiles.get(`_deleted/${todayUtc}/catalog/s1/d.jpg`).body.equals(fileBody('catalog/s1/d.jpg')), r.out);
+  mainFiles.delete('quotes/q1/c.pdf');
+  r = await runBk('backup-bucket.js');
+  check('deleted from main: moved to the trash, not removed', summaryOf(r.out).trashed === 1 && !current().includes('quotes/q1/c.pdf') && bkFiles.has(`_deleted/${todayUtc}/quotes/q1/c.pdf`), r.out);
+  r = await runBk('backup-bucket.js', [], { BACKUP_NOW: inDays(30) });
+  check('trash kept for 30 days', summaryOf(r.out).purged === 0 && trashKeys().length === 2, r.out);
+  r = await runBk('backup-bucket.js', [], { BACKUP_NOW: inDays(31) });
+  check('...removed after 30 days', summaryOf(r.out).purged === 2 && trashKeys().length === 0, r.out);
+
+  // guard: the main bucket looks (almost) empty -> probably misconfigured: nothing goes to the trash
+  for (let i = 0; i < 6; i++) mainS3.put('files', `orders/o3/${i}.pdf`, fileBody('o3-' + i), 'application/pdf');
+  await runBk('backup-bucket.js');
+  const curBefore = current().length;
+  const evBefore = events().length, ciBefore = checkIns().length;
+  r = await runBk('backup-bucket.js', [], { S3_BUCKET: 'wrong-empty-bucket' });
+  const guardEv = events().slice(evBefore).find((e) => e.payload.tags && e.payload.tags.step === 'guard');
+  check('guard: main bucket empty -> exit 1, nothing moved to the trash', r.code === 1 && /Backup guard/.test(r.out) && current().length === curBefore && curBefore >= 10 && trashKeys().length === 0, r.out);
+  check('...Sentry alert tagged area=backup, cron check-in error', !!guardEv && guardEv.payload.tags.area === 'backup' && checkIns().slice(ciBefore).map((c) => c.payload.status).join() === 'in_progress,error', { guardEv: guardEv && guardEv.payload.tags });
+  // one file failing doesn't stop the others; reported to Sentry, run exits 1
+  mainS3.put('files', 'orders/o4/ok.pdf', fileBody('ok'), 'application/pdf'); mainS3.put('files', 'orders/o4/broken.pdf', fileBody('broken'), 'application/pdf');
+  mainS3.failGet.add('orders/o4/broken.pdf');
+  const ev2 = events().length;
+  r = await runBk('backup-bucket.js');
+  mainS3.failGet.clear();
+  const copyEv = events().slice(ev2).find((e) => e.payload.tags && e.payload.tags.step === 'copy');
+  check('file error: others copied, exit 1', r.code === 1 && current().includes('orders/o4/ok.pdf') && !current().includes('orders/o4/broken.pdf'), r.out);
+  check('...Sentry event area=backup with the key', !!copyEv && copyEv.payload.tags.area === 'backup' && copyEv.payload.extra.key === 'orders/o4/broken.pdf', copyEv && copyEv.payload);
+  r = await runBk('backup-bucket.js');
+  check('next run picks the failed file up, exit 0', r.code === 0 && current().includes('orders/o4/broken.pdf'), r.out);
+  r = await runBk('backup-bucket.js', [], { BACKUP_S3_ENDPOINT: BK_ENV.S3_ENDPOINT, BACKUP_S3_BUCKET: 'files' });
+  check('backup bucket = main bucket -> refused, exit 1', r.code === 1 && /is the main bucket/.test(r.out) && mainFiles.size > 0, r.out);
+
+  // restore
+  const snapA = mainFiles.get('orders/o1/a.pdf'), snapD = mainFiles.get('catalog/s1/d.jpg');
+  mainFiles.delete('orders/o1/a.pdf'); mainFiles.delete('catalog/s1/d.jpg');
+  r = await runBk('restore-bucket.js');
+  check('restore dry run: 2 missing listed, nothing written', r.code === 0 && /Missing from the main bucket: 2/.test(r.out) && /Would restore: 2 file/.test(r.out) && !mainFiles.has('orders/o1/a.pdf') &&
+    /From backup: files-backup\s+->\s+to main: files/.test(r.out), r.out);
+  r = await runBk('restore-bucket.js', ['--prefix', 'orders/', '--apply']);
+  check('--prefix orders/ --apply: only that file restored', r.code === 0 && mainFiles.has('orders/o1/a.pdf') && !mainFiles.has('catalog/s1/d.jpg'), r.out);
+  r = await runBk('restore-bucket.js', ['--apply']);
+  check('--apply: the rest restored, same bytes and type', r.code === 0 && mainFiles.get('catalog/s1/d.jpg').body.equals(snapD.body) && mainFiles.get('catalog/s1/d.jpg').contentType === 'image/jpeg' &&
+    mainFiles.get('orders/o1/a.pdf').body.equals(snapA.body), r.out);
+  r = await runBk('restore-bucket.js');
+  check('...then nothing left to restore', /Missing from the main bucket: 0/.test(r.out) && /Different in the main bucket: 0/.test(r.out), r.out);
+  mainS3.put('files', 'orders/o2/f.pdf', Buffer.from('tampered'), 'application/pdf');
+  r = await runBk('restore-bucket.js', ['--apply']);
+  check('different file: listed, kept without --overwrite', /Different in the main bucket: 1 \(kept/.test(r.out) && mainFiles.get('orders/o2/f.pdf').body.equals(Buffer.from('tampered')), r.out);
+  r = await runBk('restore-bucket.js', ['--key', 'orders/o2/f.pdf', '--overwrite', '--apply']);
+  check('--key ... --overwrite --apply: backup version back', r.code === 0 && mainFiles.get('orders/o2/f.pdf').body.equals(fileBody('f')), r.out);
+  mainFiles.delete('orders/o2/g.pdf');
+  await runBk('backup-bucket.js');
+  r = await runBk('restore-bucket.js', ['--key', 'orders/o2/g.pdf']);
+  check('file deleted from main and trashed in the backup: not restored by default', /Missing from the main bucket: 0/.test(r.out), r.out);
+  r = await runBk('restore-bucket.js', ['--key', 'orders/o2/g.pdf', '--include-deleted', '--apply']);
+  check('--include-deleted: restored from the trash to its original key', r.code === 0 && mainFiles.get('orders/o2/g.pdf').body.equals(fileBody('g')) && /from _deleted\/\d{4}-\d\d-\d\d\/orders\/o2\/g\.pdf/.test(r.out), r.out);
+  check('unknown option -> exit 2', (await runBk('restore-bucket.js', ['--aply'])).code === 2);
+  for (const s of [mainS3.server, backupS3.server, sentryServer]) s.close();
+
   console.log('\n== 18d. L6 change-password attempts limited per user ==');
   await mkCo('sup11', 'SUPPLIER', 0); await mkCo('sup12', 'SUPPLIER', 0);
   const T11 = (await call('POST', '/auth/login', null, { email: 'sup11@t.test', password: 'pw123456' }, undefined, { 'X-Forwarded-For': '192.0.2.11, 10.0.0.1' })).data.token;
