@@ -1647,6 +1647,24 @@ async function newRfq(budget = 500, extra = {}) {
   check('migration 8: stored "Restaurant Groceries" -> "Restaurants & Cafés", others untouched', (await db.rFQ.findUnique({ where: { id: m8.id } })).category === 'Restaurants & Cafés' &&
     (await db.rFQ.findUnique({ where: { id: staleCat.id } })).category === 'Rental Cars');
 
+  console.log('\n== 18c13. stage 5: RFQ specifications ==');
+  const SPEC = '  Extra virgin, cold pressed.\nDelivered in 1 L glass bottles, best-before at least 12 months.  ';
+  r = await call('POST', '/rfqs', B1, catBody('Restaurants & Cafés', { title: 'spec rfq', specifications: SPEC }));
+  const specRfq = r.data;
+  check('specifications saved, trimmed', r.status === 201 && specRfq.specifications === SPEC.trim(), r.data);
+  check('over 2000 characters -> 400', (await call('POST', '/rfqs', B1, catBody('Restaurants & Cafés', { specifications: 'x'.repeat(2001) }))).status === 400 &&
+    (await call('POST', '/rfqs', B1, catBody('Restaurants & Cafés', { specifications: 'x'.repeat(2000) }))).status === 201);
+  check('not text -> 400', (await call('POST', '/rfqs', B1, catBody('Restaurants & Cafés', { specifications: 42 }))).status === 400);
+  check('empty -> stored as null', (await call('POST', '/rfqs', B1, catBody('Restaurants & Cafés', { specifications: '   ' }))).data.specifications === null);
+  check('supplier sees them in Opportunities and the RFQ', (await call('GET', '/rfqs', S3)).data.find((x) => x.id === specRfq.id).specifications === SPEC.trim() &&
+    (await call('GET', `/rfqs/${specRfq.id}`, S3)).data.specifications === SPEC.trim());
+  check('editable before quotes', (await call('PATCH', `/rfqs/${specRfq.id}`, B1, { specifications: 'Updated spec' })).data.specifications === 'Updated spec');
+  await db.wallet.update({ where: { companyId: 'sup3' }, data: { balance: 100 } });
+  await call('POST', `/rfqs/${specRfq.id}/quotes`, S3, { unitPrice: 2 });
+  r = await call('PATCH', `/rfqs/${specRfq.id}`, B1, { specifications: 'Changed after a quote' });
+  check('frozen after the first quote -> 409', r.status === 409 && (await db.rFQ.findUnique({ where: { id: specRfq.id } })).specifications === 'Updated spec', r.data);
+  check('DB refuses more than 2000 characters (CHECK)', await db.rFQ.update({ where: { id: specRfq.id }, data: { specifications: 'y'.repeat(2001) } }).then(() => false, () => true));
+
   console.log('\n== 18d. L6 change-password attempts limited per user ==');
   await mkCo('sup11', 'SUPPLIER', 0); await mkCo('sup12', 'SUPPLIER', 0);
   const T11 = (await call('POST', '/auth/login', null, { email: 'sup11@t.test', password: 'pw123456' }, undefined, { 'X-Forwarded-For': '192.0.2.11, 10.0.0.1' })).data.token;

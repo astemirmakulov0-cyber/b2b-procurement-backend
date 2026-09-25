@@ -183,6 +183,8 @@ model RFQ {
   buyerCompany   Company   @relation("BuyerRFQs", fields: [buyerCompanyId], references: [id])
   title          String
   description    String
+  // optional details for suppliers, up to 2000 characters (CHECK in migration 9); frozen once quotes exist
+  specifications String?
   category       String?
   quantity       Int?
   unit           String?
