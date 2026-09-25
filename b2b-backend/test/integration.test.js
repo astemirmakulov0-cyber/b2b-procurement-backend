@@ -58,7 +58,7 @@ async function seed() {
 }
 const future = () => new Date(Date.now() + 7 * 86400e3).toISOString();
 async function newRfq(budget = 500, extra = {}) {
-  const r = await call('POST', '/rfqs', tok('BUYER', 'buyer1'), { title: 'T', description: 'D', budget, deadline: future(), publish: true, ...extra });
+  const r = await call('POST', '/rfqs', tok('BUYER', 'buyer1'), { title: 'T', description: 'D', quantity: 1, budget, deadline: future(), publish: true, ...extra });
   return r.data;
 }
 
@@ -226,7 +226,7 @@ async function newRfq(budget = 500, extra = {}) {
     company: { create: { id: 'buyer3', name: 'Co buyer3', type: 'BUYER', verificationStatus: 'VERIFIED', wallet: { create: { balance: 0 } } } } } });
   const B3 = tok('BUYER', 'buyer3');
   await db.wallet.update({ where: { companyId: 'sup1' }, data: { balance: 100 } });
-  const d3 = await call('POST', '/rfqs', B3, { title: 'B3 rfq', description: 'x', budget: 200, deadline: future(), publish: true });
+  const d3 = await call('POST', '/rfqs', B3, { title: 'B3 rfq', description: 'x', quantity: 1, budget: 200, deadline: future(), publish: true });
   check('sup1 quotes on buyer3 RFQ (fee 10)', (await call('POST', `/rfqs/${d3.data.id}/quotes`, S1, { price: 150 })).status === 201 && (await bal('sup1')) === 90);
   const draft3 = await call('POST', '/rfqs', B3, { title: 'B3 draft', description: 'x', budget: 50, deadline: future() });
   check('buyer3 login works before', (await call('POST', '/auth/login', null, { email: 'buyer3@t.test', password: 'pw123456' })).status === 200);
@@ -364,7 +364,7 @@ async function newRfq(budget = 500, extra = {}) {
   // received: also dispatch and confirm receipt, so the invoice is payable
   async function makeOrder(price, supTok, supId, buyerTok = B1, { received = false } = {}) {
     await db.wallet.update({ where: { companyId: supId }, data: { balance: 1000 } });
-    const rf = (await call('POST', '/rfqs', buyerTok, { title: 'Pay ' + price, description: 'x', budget: 100, deadline: future(), publish: true })).data;
+    const rf = (await call('POST', '/rfqs', buyerTok, { title: 'Pay ' + price, description: 'x', quantity: 1, budget: 100, deadline: future(), publish: true })).data;
     await call('POST', `/rfqs/${rf.id}/quotes`, supTok, { price });
     const q = await db.quote.findFirst({ where: { rfqId: rf.id } });
     await call('POST', `/quotes/${q.id}/award`, buyerTok, {});
@@ -476,7 +476,7 @@ async function newRfq(budget = 500, extra = {}) {
   const p5 = (await call('POST', `/invoices/${i5.id}/payments`, B5, { amount: 80, method: 'bank_transfer' })).data.payment;
   await call('PATCH', `/payments/${p5.id}/confirm`, S5, {});
   await db.wallet.update({ where: { companyId: 'sup1' }, data: { balance: 100 } });
-  const open5 = (await call('POST', '/rfqs', B5, { title: 'buyer5 open', description: 'x', budget: 200, deadline: future(), publish: true })).data;
+  const open5 = (await call('POST', '/rfqs', B5, { title: 'buyer5 open', description: 'x', quantity: 1, budget: 200, deadline: future(), publish: true })).data;
   await call('POST', `/rfqs/${open5.id}/quotes`, S1, { price: 150 }); // sup1 pays 10
   r = await call('DELETE', '/admin/companies/buyer5', ADM);
   check('delete buyer5 with trading history -> anonymized', r.status === 200 && r.data.mode === 'anonymized', r.data);
@@ -566,7 +566,7 @@ async function newRfq(budget = 500, extra = {}) {
   check('not verified: name change keeps PENDING', r.data.reverificationRequired === false && (await coStatus('sup8')) === 'PENDING');
 
   console.log('\n== 15. M12 budget required to publish, M13 order rows show LPO and counterparty ==');
-  const noBudget = { title: 'nb', description: 'x', deadline: future() };
+  const noBudget = { title: 'nb', description: 'x', quantity: 5, deadline: future() };
   r = await call('POST', '/rfqs', B1, { ...noBudget, publish: true });
   check('publish without budget -> 400', r.status === 400 && /budget is required/.test(r.data.error), r.data);
   r = await call('POST', '/rfqs', B1, noBudget);
@@ -653,7 +653,7 @@ async function newRfq(budget = 500, extra = {}) {
   check('non-admin cannot fetch documents -> 403', (await call('GET', `/admin/companies/sup9/documents/${pdfId}`, S9)).status === 403);
 
   await db.wallet.update({ where: { companyId: 'sup2' }, data: { balance: 100 } });
-  const nq = (await call('POST', '/rfqs', B1, { title: 'Office desks', description: 'x', budget: 100, deadline: future(), publish: true })).data;
+  const nq = (await call('POST', '/rfqs', B1, { title: 'Office desks', description: 'x', quantity: 1, budget: 100, deadline: future(), publish: true })).data;
   const notesBefore = await db.notification.count({ where: { companyId: 'buyer1', type: 'NEW_QUOTE' } });
   check('supplier quotes -> 201', (await call('POST', `/rfqs/${nq.id}/quotes`, S2, { price: 64.5 })).status === 201);
   await new Promise((res) => setTimeout(res, 150)); // notify() runs right after the response
@@ -1545,6 +1545,48 @@ async function newRfq(budget = 500, extra = {}) {
   check('--include-deleted: restored from the trash to its original key', r.code === 0 && mainFiles.get('orders/o2/g.pdf').body.equals(fileBody('g')) && /from _deleted\/\d{4}-\d\d-\d\d\/orders\/o2\/g\.pdf/.test(r.out), r.out);
   check('unknown option -> exit 2', (await runBk('restore-bucket.js', ['--aply'])).code === 2);
   for (const s of [mainS3.server, backupS3.server, sentryServer]) s.close();
+
+  console.log('\n== 18c10. stage 1: quotes priced per unit, total = unit price × quantity ==');
+  await db.wallet.updateMany({ where: { companyId: { in: ['sup1', 'sup2', 'sup3'] } }, data: { balance: 100 } });
+  const upRfq = await newRfq(200, { title: 'Olive oil 1L', quantity: 12, unit: 'bottle' });
+  r = await call('POST', `/rfqs/${upRfq.id}/quotes`, S1, { unitPrice: 1.235, deliveryTimeDays: 3 });
+  let upQ = r.data;
+  check('unit price 1.235 × 12 -> total 14.820, unit price kept', r.status === 201 && upQ.price === '14.82' && upQ.unitPrice === '1.235', r.data);
+  check('bid fee is still 5% of the budget (10.000)', (await bal('sup1')) === 90);
+  await settle();
+  const upNote = await db.notification.findFirst({ where: { companyId: 'buyer1', type: 'NEW_QUOTE', body: { contains: 'Olive oil 1L' } } });
+  check('buyer notification: total and unit price × quantity', upNote && upNote.body.includes('14.820 BHD total (1.235 BHD × 12)'), upNote && upNote.body);
+  r = await call('POST', `/rfqs/${upRfq.id}/quotes`, S2, { price: 2 });
+  check('pages from before unit pricing: price is read as the unit price -> total 24.000', r.status === 201 && r.data.unitPrice === '2' && r.data.price === '24', r.data);
+  r = await call('POST', `/rfqs/${upRfq.id}/quotes`, S3, { unitPrice: 1.2345 });
+  check('unit price with 4 decimals -> 400', r.status === 400 && /unitPrice can have at most 3 decimal/.test(r.data.error), r.data);
+  check('unit price 0 / negative / text -> 400', (await call('POST', `/rfqs/${upRfq.id}/quotes`, S3, { unitPrice: 0 })).status === 400 &&
+    (await call('POST', `/rfqs/${upRfq.id}/quotes`, S3, { unitPrice: -1 })).status === 400 && (await call('POST', `/rfqs/${upRfq.id}/quotes`, S3, { unitPrice: '5' })).status === 400);
+  const bigRfq = await newRfq(100, { title: 'huge', quantity: 1000000 });
+  r = await call('POST', `/rfqs/${bigRfq.id}/quotes`, S3, { unitPrice: 1000000 });
+  check('total above the money limit -> 400, no fee charged', r.status === 400 && /too large/.test(r.data.error) && (await bal('sup3')) === 100, r.data);
+  r = await call('GET', `/rfqs/${upRfq.id}/quotes`, B1);
+  check('Compare bids: unit price and total for each quote', r.status === 200 && r.data.some((q) => q.unitPrice === '1.235' && q.price === '14.82') && r.data.every((q) => 'unitPrice' in q), r.data.map((q) => [q.unitPrice, q.price]));
+  const ownRow = (await call('GET', '/rfqs', S1)).data.find((x) => x.id === upRfq.id);
+  check('supplier RFQ list: own unit price and total', ownRow.quotes[0].unitPrice === '1.235' && ownRow.quotes[0].price === '14.82', ownRow.quotes);
+  // LPO, invoice, order use the total
+  check('award -> LPO total = quote total', (await call('POST', `/quotes/${upQ.id}/award`, B1, {})).status === 201 && (await db.lPO.findFirst({ where: { quoteId: upQ.id } })).totalAmount.toString() === '14.82');
+  const upLpo = await db.lPO.findFirst({ where: { quoteId: upQ.id } });
+  r = await call('PATCH', `/lpos/${upLpo.id}/accept`, S1);
+  check('accept -> invoice amount = quote total', r.status === 200 && (await db.invoice.findUnique({ where: { orderId: r.data.order.id } })).amount.toString() === '14.82');
+  // quantity required to publish
+  r = await call('POST', '/rfqs', B1, { title: 'no qty', description: 'x', budget: 50, deadline: future(), publish: true });
+  check('publish without quantity -> 400', r.status === 400 && /quantity/.test(r.data.error), r.data);
+  check('publish with quantity 0 or 2.5 -> 400', (await call('POST', '/rfqs', B1, { title: 'q0', description: 'x', budget: 50, quantity: 0, deadline: future(), publish: true })).status === 400 &&
+    (await call('POST', '/rfqs', B1, { title: 'q25', description: 'x', budget: 50, quantity: 2.5, deadline: future(), publish: true })).status === 400);
+  const qDraft = (await call('POST', '/rfqs', B1, { title: 'draft no qty', description: 'x', budget: 50, deadline: future() })).data;
+  check('draft without quantity -> allowed', qDraft && qDraft.status === 'DRAFT');
+  check('publishing that draft -> 400 until a quantity is set', (await call('PATCH', `/rfqs/${qDraft.id}`, B1, { status: 'PUBLISHED' })).status === 400 &&
+    (await call('PATCH', `/rfqs/${qDraft.id}`, B1, { status: 'PUBLISHED', quantity: 4 })).status === 200);
+  check('published RFQ: clearing its quantity -> 400', (await call('PATCH', `/rfqs/${qDraft.id}`, B1, { quantity: null })).status === 400);
+  const legacyNoQty = await db.rFQ.create({ data: { buyerCompanyId: 'buyer1', title: 'legacy no qty', description: 'x', budget: 50, status: 'PUBLISHED', deadline: new Date(Date.now() + 86400e3) } });
+  r = await call('POST', `/rfqs/${legacyNoQty.id}/quotes`, S3, { unitPrice: 3 });
+  check('quote on an RFQ without quantity -> 400, no fee', r.status === 400 && /no quantity/.test(r.data.error) && (await bal('sup3')) === 100, r.data);
 
   console.log('\n== 18d. L6 change-password attempts limited per user ==');
   await mkCo('sup11', 'SUPPLIER', 0); await mkCo('sup12', 'SUPPLIER', 0);

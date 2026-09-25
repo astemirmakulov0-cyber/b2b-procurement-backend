@@ -17,4 +17,4 @@ function parseAmount(raw, field = 'amount') {
 // Fixed 3-decimal string for messages and API fields, e.g. "25.000"
 const formatAmount = (d) => new Prisma.Decimal(d).toFixed(MONEY_DECIMALS);
 
-module.exports = { MONEY_DECIMALS, parseAmount, formatAmount };
+module.exports = { MONEY_DECIMALS, MONEY_MAX, parseAmount, formatAmount };

@@ -208,7 +208,11 @@ model Quote {
   rfq                RFQ         @relation(fields: [rfqId], references: [id])
   supplierCompanyId  String
   supplierCompany    Company     @relation("SupplierQuotes", fields: [supplierCompanyId], references: [id])
+  // the quote total: unitPrice × the RFQ's quantity (what the LPO, invoice and payments use).
+  // Quotes from before unit pricing (unitPrice NULL) were entered as a total.
   price              Decimal     @db.Decimal(12, 3)
+  // price per unit as the supplier entered it (BHD, 3 decimals); CHECK > 0 in migration 7
+  unitPrice          Decimal?    @db.Decimal(12, 3)
   // only BHD for now: enforced in submitQuote and by the CHECK constraint "Quote_currency_bhd_check"
   // (migration 1_l2_l3; Prisma schema can't express CHECK constraints)
   currency           String      @default("BHD")
