@@ -134,6 +134,9 @@ model Company {
   notifications    Notification[]
   consentAt        DateTime?
   isActive         Boolean           @default(true)
+  // email notification preferences (in-app notifications are never gated by these)
+  emailNewRfq             Boolean @default(true)
+  emailOtherNotifications Boolean @default(true)
 
 }
 

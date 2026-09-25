@@ -3,6 +3,7 @@ const asyncHandler = require('../utils/asyncHandler');
 const { CANCELLABLE_STATUSES, cancelRfqInTx } = require('../utils/rfqCancel');
 const { parseAmount } = require('../utils/money');
 const { checkCategory } = require('../utils/categories');
+const { notifyNewRfq } = require('../utils/notify');
 
 const BUDGET_REQUIRED = 'budget is required to publish an RFQ (suppliers pay 5% of it to submit a quote)';
 const QUANTITY_REQUIRED = 'quantity (a whole number, at least 1) is required to publish an RFQ (quotes are priced per unit)';
@@ -78,6 +79,7 @@ const createRFQ = asyncHandler(async (req, res) => {
     },
   });
   res.status(201).json(rfq);
+  if (rfq.status === 'PUBLISHED') notifyNewRfq('New RFQ in ' + rfq.category, rfq.title);
 });
 
 // GET /api/rfqs  - buyers see their own; suppliers see published RFQs (with optional category filter for matching)
@@ -248,11 +250,12 @@ const updateRFQ = asyncHandler(async (req, res) => {
         status,
       },
     });
-    return { rfq };
+    return { rfq, justPublished: status === 'PUBLISHED' && existing.status !== 'PUBLISHED' };
   });
 
   if (result.error) return res.status(result.status).json({ error: result.error });
   res.json(result.rfq);
+  if (result.justPublished) notifyNewRfq('New RFQ in ' + result.rfq.category, result.rfq.title);
 });
 
 // POST /api/rfqs/:id/cancel  (buyer, owner only)

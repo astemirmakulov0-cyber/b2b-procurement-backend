@@ -26,6 +26,8 @@ const updateMyCompany = asyncHandler(async (req, res) => {
   const name = trim(req.body.name);
   const registrationNumber = trim(req.body.registrationNumber);
   if (name !== undefined && !name) return res.status(400).json({ error: 'name cannot be empty' });
+  const emailNewRfq = typeof req.body.emailNewRfq === 'boolean' ? req.body.emailNewRfq : undefined;
+  const emailOtherNotifications = typeof req.body.emailOtherNotifications === 'boolean' ? req.body.emailOtherNotifications : undefined;
 
   const current = await prisma.company.findUnique({ where: { id: req.user.companyId } });
   if (!current) return res.status(404).json({ error: 'Company not found' });
@@ -38,7 +40,7 @@ const updateMyCompany = asyncHandler(async (req, res) => {
   const company = await prisma.company.update({
     where: { id: current.id },
     data: {
-      name, country, address, phone,
+      name, country, address, phone, emailNewRfq, emailOtherNotifications,
       registrationNumber: registrationNumber === undefined ? undefined : (registrationNumber || null),
       ...(reverify ? { verificationStatus: 'IN_REVIEW', verificationNotes: 'Re-verification required: company name or CR number changed' } : {}),
     },

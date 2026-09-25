@@ -129,7 +129,11 @@ const updateOrderStatus = asyncHandler(async (req, res) => {
   res.json(updated);
 
   const other = isBuyer ? order.lpo.supplierCompanyId : order.lpo.buyerCompanyId;
-  notify(other, 'ORDER_STATUS', 'Order ' + statusLabel(status), reason ? 'Reason: ' + reason.slice(0, 300) : undefined, order.id);
+  if (status === 'DISPUTED') {
+    notify(other, 'DISPUTE_OPENED', 'Dispute opened', reason ? 'Reason: ' + reason.slice(0, 300) : undefined, order.id);
+  } else {
+    notify(other, 'ORDER_STATUS', 'Order ' + statusLabel(status), reason ? 'Reason: ' + reason.slice(0, 300) : undefined, order.id);
+  }
 });
 
 // GET /api/admin/orders?status=DISPUTED  (admin) - orders with both parties and, for disputes, the buyer's reason

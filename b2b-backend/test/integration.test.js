@@ -21,13 +21,28 @@ const sentryPath = require.resolve('@sentry/node');
 require.cache[sentryPath] = { id: sentryPath, filename: sentryPath, loaded: true,
   exports: { init() {}, setupExpressErrorHandler() {}, captureException(err, ctx) { sentryCaptured.push({ err, ctx }); }, captureMessage(msg, level) { sentryCaptured.push({ msg, level }); } } };
 
-// Stub Resend so tests never call the real email API; sent emails are recorded, and a delay can be set
-// to simulate a slow email API
+// Stub Resend so tests never call the real email API; sent emails are recorded, a delay can be set to
+// simulate a slow email API, and forceEmailError can be set to make the next send/batch fail like Resend
+// returning { error } (never throws, matching the real SDK).
 const sentEmails = [];
 let emailDelayMs = 0;
+let forceEmailError = null;
 const resendPath = require.resolve('resend');
 require.cache[resendPath] = { id: resendPath, filename: resendPath, loaded: true,
-  exports: { Resend: class { constructor() { this.emails = { send: async (msg) => { if (emailDelayMs) await new Promise((r) => setTimeout(r, emailDelayMs)); sentEmails.push(msg); return { error: null }; } }; } } } };
+  exports: { Resend: class {
+    constructor() {
+      this.emails = { send: async (msg) => {
+        if (emailDelayMs) await new Promise((r) => setTimeout(r, emailDelayMs));
+        if (forceEmailError) { const e = forceEmailError; forceEmailError = null; return { error: e }; }
+        sentEmails.push(msg); return { error: null };
+      } };
+      this.batch = { send: async (msgs) => {
+        if (emailDelayMs) await new Promise((r) => setTimeout(r, emailDelayMs));
+        if (forceEmailError) { const e = forceEmailError; forceEmailError = null; return { error: e }; }
+        sentEmails.push(...msgs); return { error: null };
+      } };
+    }
+  } } };
 
 const jwt = require('jsonwebtoken');
 const bcrypt = require('bcryptjs');
@@ -845,7 +860,7 @@ async function newRfq(budget = 500, extra = {}) {
   let msgs = await db.message.findMany({ where: { orderId: dd.order.id } });
   check('reason written to the order chat by the buyer', msgs.length === 1 && msgs[0].senderCompanyId === 'buyer1' && msgs[0].body === 'Dispute opened: Goods damaged on arrival', msgs);
   await settle();
-  check('supplier notified with the reason', (await notesOf('sup2', 'ORDER_STATUS', dd.order.id)).some((n) => n.title === 'Order disputed' && n.body === 'Reason: Goods damaged on arrival'));
+  check('supplier notified with the reason', (await notesOf('sup2', 'DISPUTE_OPENED', dd.order.id)).some((n) => n.title === 'Dispute opened' && n.body === 'Reason: Goods damaged on arrival'));
 
   // admin list and chat access
   r = await call('GET', '/admin/orders?status=DISPUTED', ADM);
@@ -1763,6 +1778,110 @@ async function newRfq(budget = 500, extra = {}) {
     await appPrisma.$transaction(async (tx) => { await tx.$executeRaw`SELECT pg_sleep(16)`; });
     check('transaction is still capped at 15s', false);
   } catch (e) { check('transaction is still capped at 15s', /timeout|expired|closed/i.test(e.message), e.message.split('\n').pop()); }
+
+  console.log('\n== 21. Email notifications ==');
+  await db.wallet.updateMany({ where: { companyId: { in: ['sup1', 'sup2', 'sup3'] } }, data: { balance: 500 } });
+  const buyer1Row = await db.company.findUnique({ where: { id: 'buyer1' } });
+  check('email prefs default to true', buyer1Row.emailNewRfq === true && buyer1Row.emailOtherNotifications === true, buyer1Row);
+
+  // -- NEW_RFQ fan-out: every VERIFIED, active supplier gets an in-app notification + email; others don't --
+  await mkCo('supUnverified', 'SUPPLIER', 0);
+  await db.company.update({ where: { id: 'supUnverified' }, data: { verificationStatus: 'PENDING' } });
+  await mkCo('supInactive', 'SUPPLIER', 0);
+  await db.company.update({ where: { id: 'supInactive' }, data: { isActive: false } });
+  await mkCo('supNoEmail', 'SUPPLIER', 0);
+  await db.company.update({ where: { id: 'supNoEmail' }, data: { emailNewRfq: false } });
+
+  sentEmails.length = 0;
+  const escTitle = 'Widgets & <b>Gadgets</b> "special"';
+  const rfqForFanout = await newRfq(200, { title: escTitle });
+  await new Promise((res) => setTimeout(res, 250)); // notifyNewRfq() runs in the background after the response
+
+  check('NEW_RFQ in-app notification created for verified active suppliers',
+    (await db.notification.count({ where: { type: 'NEW_RFQ', companyId: 'sup1' } })) > 0 &&
+    (await db.notification.count({ where: { type: 'NEW_RFQ', companyId: 'sup2' } })) > 0);
+  check('NEW_RFQ notification skips unverified/inactive suppliers',
+    (await db.notification.count({ where: { type: 'NEW_RFQ', companyId: 'supUnverified' } })) === 0 &&
+    (await db.notification.count({ where: { type: 'NEW_RFQ', companyId: 'supInactive' } })) === 0);
+  check('NEW_RFQ in-app notification still created for a supplier with the email pref off (in-app is never gated)',
+    (await db.notification.count({ where: { type: 'NEW_RFQ', companyId: 'supNoEmail' } })) > 0);
+
+  const sup1Mail = sentEmails.find((m) => m.to === 'sup1@t.test' && /New RFQ/.test(m.subject));
+  check('NEW_RFQ email sent to a verified active supplier', !!sup1Mail, sup1Mail);
+  check('NEW_RFQ email escapes the RFQ title', sup1Mail && sup1Mail.html.includes('&lt;b&gt;Gadgets&lt;/b&gt;') && !sup1Mail.html.includes('<b>Gadgets</b>'), sup1Mail && sup1Mail.html);
+  check('NEW_RFQ email has an Open in Biddex button linking to the app', sup1Mail && sup1Mail.html.includes('https://app.biddex.online'), sup1Mail && sup1Mail.html);
+  check('NEW_RFQ email has a "manage in Settings" footer line', sup1Mail && /Manage email notifications in.*Settings/.test(sup1Mail.html), sup1Mail && sup1Mail.html);
+  check('NEW_RFQ email NOT sent to the supplier who disabled it', !sentEmails.find((m) => m.to === 'supNoEmail@t.test'));
+  check('NEW_RFQ email NOT sent to unverified/inactive suppliers',
+    !sentEmails.find((m) => m.to === 'supUnverified@t.test') && !sentEmails.find((m) => m.to === 'supInactive@t.test'));
+
+  // -- toggling "other" notifications off suppresses the email but not the in-app notification --
+  await db.company.update({ where: { id: 'buyer1' }, data: { emailOtherNotifications: false } });
+  sentEmails.length = 0;
+  check('supplier quotes -> 201 (buyer has emailOtherNotifications off)', (await call('POST', `/rfqs/${rfqForFanout.id}/quotes`, S2, { price: 150 })).status === 201);
+  await new Promise((res) => setTimeout(res, 200));
+  check('NEW_QUOTE in-app notification still created with the pref off',
+    (await db.notification.count({ where: { companyId: 'buyer1', type: 'NEW_QUOTE', body: { contains: rfqForFanout.title } } })) > 0);
+  check('NEW_QUOTE email NOT sent while emailOtherNotifications is off', !sentEmails.find((m) => m.to === 'buyer1@t.test'));
+  await db.company.update({ where: { id: 'buyer1' }, data: { emailOtherNotifications: true } });
+
+  sentEmails.length = 0;
+  const rfqForPrefOn = await newRfq(200);
+  check('supplier quotes again -> 201 (pref back on)', (await call('POST', `/rfqs/${rfqForPrefOn.id}/quotes`, S2, { price: 90 })).status === 201);
+  await new Promise((res) => setTimeout(res, 200));
+  check('NEW_QUOTE email sent once the pref is back on', !!sentEmails.find((m) => m.to === 'buyer1@t.test' && m.subject === 'New quote received'));
+
+  // -- notification email never delays the response, even when Resend is slow --
+  emailDelayMs = 1500;
+  sentEmails.length = 0;
+  const slowRfq = await newRfq(200);
+  const t0slow = Date.now();
+  r = await call('POST', `/rfqs/${slowRfq.id}/quotes`, S3, { price: 80 });
+  const quoteMs = Date.now() - t0slow;
+  check('quote submission responds quickly even though the notification email is slow', r.status === 201 && quoteMs < 1000, { quoteMs });
+  await new Promise((res) => setTimeout(res, 1700));
+  emailDelayMs = 0;
+
+  // -- PATCH /companies/me persists the toggles --
+  r = await call('PATCH', '/companies/me', S1, { emailNewRfq: false });
+  check('PATCH /companies/me: emailNewRfq off persists', r.status === 200 && r.data.emailNewRfq === false &&
+    (await db.company.findUnique({ where: { id: 'sup1' } })).emailNewRfq === false, r.data);
+  await call('PATCH', '/companies/me', S1, { emailNewRfq: true });
+
+  // -- a Resend failure never breaks the request and is reported to Sentry, separately from the notify() DB path --
+  const sentryBeforeErr = sentryCaptured.length;
+  forceEmailError = { message: 'stubbed Resend failure' };
+  await notify('buyer1', 'TEST_EMAIL_FAILURE', 'Resend failure test', 'body');
+  await new Promise((res) => setTimeout(res, 100));
+  const errCap = sentryCaptured[sentryCaptured.length - 1];
+  check('notify() email failure does not throw and is reported to Sentry under area notify-email',
+    sentryCaptured.length === sentryBeforeErr + 1 && errCap.ctx.tags.area === 'notify-email' && errCap.ctx.tags.notificationType === 'TEST_EMAIL_FAILURE', errCap && errCap.ctx);
+  check('the in-app notification row is still created despite the email failure',
+    (await db.notification.count({ where: { companyId: 'buyer1', type: 'TEST_EMAIL_FAILURE' } })) === 1);
+
+  // -- DISPUTE_OPENED: opening a dispute emails the other party, with the reason escaped --
+  const { order: disputeOrder } = await makeOrder(50, S3, 'sup3');
+  sentEmails.length = 0;
+  r = await call('PATCH', `/orders/${disputeOrder.id}/status`, B1, { status: 'DISPUTED', reason: 'Wrong item <script>alert(1)</script>' });
+  check('buyer opens a dispute -> 200', r.status === 200, r.data);
+  await new Promise((res) => setTimeout(res, 200));
+  const disputeNote = await db.notification.findFirst({ where: { companyId: 'sup3', type: 'DISPUTE_OPENED' }, orderBy: { createdAt: 'desc' } });
+  check('supplier gets a DISPUTE_OPENED in-app notification with the reason', disputeNote && disputeNote.body.includes('Wrong item'), disputeNote);
+  const disputeMail = sentEmails.find((m) => m.to === 'sup3@t.test' && m.subject === 'Dispute opened');
+  check('supplier gets a DISPUTE_OPENED email', !!disputeMail, disputeMail);
+  check('DISPUTE_OPENED email escapes the reason (no raw <script> tag)',
+    disputeMail && !disputeMail.html.includes('<script>') && disputeMail.html.includes('&lt;script&gt;'), disputeMail && disputeMail.html);
+
+  // a non-dispute status change still uses ORDER_STATUS, not DISPUTE_OPENED
+  const { order: cancelOrder } = await makeOrder(40, S3, 'sup3');
+  sentEmails.length = 0;
+  r = await call('PATCH', `/orders/${cancelOrder.id}/status`, S3, { status: 'CANCELLED' });
+  check('supplier cancels an unpaid order -> 200', r.status === 200, r.data);
+  await new Promise((res) => setTimeout(res, 200));
+  check('buyer gets an ORDER_STATUS notification (not DISPUTE_OPENED) for a plain cancellation',
+    (await db.notification.count({ where: { relatedOrderId: cancelOrder.id, type: 'ORDER_STATUS' } })) === 1 &&
+    (await db.notification.count({ where: { relatedOrderId: cancelOrder.id, type: 'DISPUTE_OPENED' } })) === 0);
+  check('buyer gets an email for the plain cancellation', !!sentEmails.find((m) => m.to === 'buyer1@t.test' && /Order cancelled/.test(m.subject)));
 
   console.log(`\n${pass} passed, ${fail} failed`);
   await db.$disconnect();
