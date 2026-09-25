@@ -1340,6 +1340,41 @@ async function newRfq(budget = 500, extra = {}) {
   check('unknown option -> exit 2', (await runScript('--aply')).code === 2);
   s3Server.close();
 
+  console.log('\n== 18c8. public stats for the landing page ==');
+  const publicCtrl = require(path.join(root, 'src/controllers/public.controller'));
+  const getStats = async (headers = {}) => { const res = await fetch(`${BASE}/public/stats`, { headers }); return { res, data: await res.json() }; };
+  const fresh = async () => { publicCtrl.resetStatsCache(); return (await getStats()).data; };
+  const activeVerified = (type) => db.company.count({ where: { type, verificationStatus: 'VERIFIED', isActive: true, user: { isActive: true, role: type } } });
+  const statShown = (n, min = 10) => (n >= min ? n : null);
+  // enough verified suppliers to pass the display threshold
+  for (let i = 0; (await activeVerified('SUPPLIER')) < 12; i++) await mkCo('stat' + i, 'SUPPLIER');
+  let pst = await getStats();
+  check('GET /public/stats without a token -> 200', pst.res.status === 200);
+  check('...only the four counts, numbers or null', JSON.stringify(Object.keys(pst.data)) === JSON.stringify(['suppliers', 'buyers', 'rfqs', 'quotes']) &&
+    Object.values(pst.data).every((v) => v === null || Number.isInteger(v)), pst.data);
+  check('...cached for clients 10 min, rate limit headers present', pst.res.headers.get('cache-control') === 'public, max-age=600' && !!pst.res.headers.get('ratelimit-limit'), [...pst.res.headers.keys()]);
+  check('...CORS allows the landing origin', (await getStats({ Origin: 'https://biddex.online' })).res.headers.get('access-control-allow-origin') === 'https://biddex.online');
+  let s0 = await fresh();
+  const rfqCount = await db.rFQ.count({ where: { OR: [{ status: { in: ['PUBLISHED', 'QUOTING_CLOSED', 'AWARDED'] } }, { status: 'CANCELLED', quotes: { some: {} } }] } });
+  check('counts match the database (verified active suppliers, all quotes, published RFQs)', s0.suppliers === await activeVerified('SUPPLIER') && s0.quotes === statShown(await db.quote.count()) && s0.rfqs === statShown(rfqCount), s0);
+  const buyersNow = await activeVerified('BUYER');
+  check('buyers below the threshold -> null', buyersNow < 10 ? s0.buyers === null : s0.buyers === buyersNow, { buyersNow, shown: s0.buyers });
+  check('no names or amounts in the response', !/Co |BHD|[a-f0-9]{8}-/.test(JSON.stringify(s0)));
+  // excluded: unverified, deactivated company, deactivated user, admins (no company)
+  await mkCo('statpend', 'SUPPLIER'); await db.company.update({ where: { id: 'statpend' }, data: { verificationStatus: 'PENDING' } });
+  await mkCo('statoff', 'SUPPLIER'); await db.company.update({ where: { id: 'statoff' }, data: { isActive: false } });
+  await mkCo('statuoff', 'SUPPLIER'); await db.user.update({ where: { id: 'u-statuoff' }, data: { isActive: false } });
+  await db.user.create({ data: { id: 'u-ADMIN2', email: 'admin2@t.test', passwordHash: 'x', role: 'ADMIN', emailVerified: true } });
+  check('unverified, deactivated and admin accounts are not counted', (await fresh()).suppliers === s0.suppliers);
+  // a cancelled draft (never published) doesn't count; cancelling a published RFQ that got quotes does
+  const draftR = (await call('POST', '/rfqs', B1, { title: 'stats draft', description: 'x', budget: 50, deadline: future() })).data;
+  await call('POST', `/rfqs/${draftR.id}/cancel`, B1);
+  check('cancelled draft RFQ not counted', (await fresh()).rfqs === s0.rfqs);
+  // cache: a new verified supplier shows only after the 10-minute cache expires (reset here)
+  await mkCo('statnew', 'SUPPLIER');
+  check('cached: new supplier not visible yet', (await getStats()).data.suppliers === s0.suppliers);
+  check('after the cache expires: +1', (await fresh()).suppliers === s0.suppliers + 1);
+
   console.log('\n== 18d. L6 change-password attempts limited per user ==');
   await mkCo('sup11', 'SUPPLIER', 0); await mkCo('sup12', 'SUPPLIER', 0);
   const T11 = (await call('POST', '/auth/login', null, { email: 'sup11@t.test', password: 'pw123456' }, undefined, { 'X-Forwarded-For': '192.0.2.11, 10.0.0.1' })).data.token;

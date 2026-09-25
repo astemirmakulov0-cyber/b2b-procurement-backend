@@ -30,6 +30,7 @@ const companyRoutes = require('./routes/company.routes');
 const rfqRoutes = require('./routes/rfq.routes');
 const orderRoutes = require('./routes/order.routes');
 const catalogRoutes = require('./routes/catalog.routes');
+const publicRoutes = require('./routes/public.routes');
 const errorHandler = require('./middleware/errorHandler');
 const prismaErrors = require('./middleware/prismaErrors');
 const rateLimit = require('express-rate-limit');
@@ -116,6 +117,7 @@ app.use('/api', companyRoutes);
 app.use('/api', rfqRoutes);
 app.use('/api', orderRoutes);
 app.use('/api', catalogRoutes);
+app.use('/api', publicRoutes); // no auth; under the general /api rate limiter above
 
 app.use((req, res) => res.status(404).json({ error: 'Not found' }));
 app.use(prismaErrors); // before Sentry, so request-caused DB errors arrive as 4xx and aren't reported
