@@ -130,6 +130,7 @@ model Company {
   lposAsBuyer      LPO[]             @relation("BuyerLPOs")
   lposAsSupplier   LPO[]             @relation("SupplierLPOs")
   messages         Message[]
+  orderDocuments   OrderDocument[]
   notifications    Notification[]
   consentAt        DateTime?
   isActive         Boolean           @default(true)
@@ -279,6 +280,7 @@ model Order {
   delivery Delivery?
   invoice  Invoice?
   messages Message[]
+  documents OrderDocument[]
 }
 
 model Delivery {
@@ -353,4 +355,27 @@ model Notification {
 
   // bell: WHERE companyId ORDER BY createdAt DESC LIMIT 50; read-all: WHERE companyId AND read = false
   @@index([companyId, createdAt])
+}
+
+// A file attached to an order: delivery note, invoice or other document. The file itself is in the private
+// storage bucket under storageKey (never overwritten); only the order's parties and admins can get it.
+// kind: DELIVERY_NOTE | INVOICE | OTHER (CHECK constraint in the migration, like Quote.currency).
+model OrderDocument {
+  id                  String    @id @default(uuid())
+  orderId             String
+  order               Order     @relation(fields: [orderId], references: [id])
+  kind                String
+  // original name, shown in the list and used for the download
+  fileName            String
+  contentType         String
+  sizeBytes           Int
+  storageKey          String    @unique
+  uploadedByCompanyId String
+  uploadedByCompany   Company   @relation(fields: [uploadedByCompanyId], references: [id])
+  createdAt           DateTime  @default(now())
+  // soft delete: hidden from the list, the stored file is kept
+  deletedAt           DateTime?
+
+  // documents panel: WHERE orderId AND deletedAt IS NULL ORDER BY createdAt
+  @@index([orderId, createdAt])
 }

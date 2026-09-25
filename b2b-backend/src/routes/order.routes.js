@@ -4,6 +4,7 @@ const orderCtrl = require('../controllers/order.controller');
 const paymentCtrl = require('../controllers/payment.controller');
 const messageCtrl = require('../controllers/message.controller');
 const notificationCtrl = require('../controllers/notification.controller');
+const documentCtrl = require('../controllers/document.controller');
 const { authRequired, requireRole } = require('../middleware/auth');
 
 // LPO
@@ -17,6 +18,12 @@ router.get('/orders/:id', authRequired, orderCtrl.getOrder);
 router.patch('/orders/:id/status', authRequired, orderCtrl.updateOrderStatus);
 router.patch('/orders/:id/delivery', authRequired, requireRole('SUPPLIER'), orderCtrl.updateDelivery);
 router.post('/orders/:id/receipt', authRequired, requireRole('BUYER'), orderCtrl.confirmReceipt);
+
+// Order documents (files in the private storage bucket)
+router.get('/orders/:id/documents', authRequired, documentCtrl.listOrderDocuments);
+router.post('/orders/:id/documents', authRequired, requireRole('BUYER', 'SUPPLIER'), documentCtrl.uploadOrderDocument);
+router.get('/documents/:id/download', authRequired, documentCtrl.downloadDocument);
+router.delete('/documents/:id', authRequired, requireRole('BUYER', 'SUPPLIER'), documentCtrl.deleteDocument);
 
 // Admin: disputes
 router.get('/admin/orders', authRequired, requireRole('ADMIN'), orderCtrl.listOrdersAdmin);
