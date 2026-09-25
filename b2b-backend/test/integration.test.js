@@ -58,7 +58,7 @@ async function seed() {
 }
 const future = () => new Date(Date.now() + 7 * 86400e3).toISOString();
 async function newRfq(budget = 500, extra = {}) {
-  const r = await call('POST', '/rfqs', tok('BUYER', 'buyer1'), { title: 'T', description: 'D', quantity: 1, budget, deadline: future(), publish: true, ...extra });
+  const r = await call('POST', '/rfqs', tok('BUYER', 'buyer1'), { title: 'T', description: 'D', category: 'Restaurants & Cafés', quantity: 1, budget, deadline: future(), publish: true, ...extra });
   return r.data;
 }
 
@@ -226,7 +226,7 @@ async function newRfq(budget = 500, extra = {}) {
     company: { create: { id: 'buyer3', name: 'Co buyer3', type: 'BUYER', verificationStatus: 'VERIFIED', wallet: { create: { balance: 0 } } } } } });
   const B3 = tok('BUYER', 'buyer3');
   await db.wallet.update({ where: { companyId: 'sup1' }, data: { balance: 100 } });
-  const d3 = await call('POST', '/rfqs', B3, { title: 'B3 rfq', description: 'x', quantity: 1, budget: 200, deadline: future(), publish: true });
+  const d3 = await call('POST', '/rfqs', B3, { title: 'B3 rfq', description: 'x', category: 'Restaurants & Cafés', quantity: 1, budget: 200, deadline: future(), publish: true });
   check('sup1 quotes on buyer3 RFQ (fee 10)', (await call('POST', `/rfqs/${d3.data.id}/quotes`, S1, { price: 150 })).status === 201 && (await bal('sup1')) === 90);
   const draft3 = await call('POST', '/rfqs', B3, { title: 'B3 draft', description: 'x', budget: 50, deadline: future() });
   check('buyer3 login works before', (await call('POST', '/auth/login', null, { email: 'buyer3@t.test', password: 'pw123456' })).status === 200);
@@ -364,7 +364,7 @@ async function newRfq(budget = 500, extra = {}) {
   // received: also dispatch and confirm receipt, so the invoice is payable
   async function makeOrder(price, supTok, supId, buyerTok = B1, { received = false } = {}) {
     await db.wallet.update({ where: { companyId: supId }, data: { balance: 1000 } });
-    const rf = (await call('POST', '/rfqs', buyerTok, { title: 'Pay ' + price, description: 'x', quantity: 1, budget: 100, deadline: future(), publish: true })).data;
+    const rf = (await call('POST', '/rfqs', buyerTok, { title: 'Pay ' + price, description: 'x', category: 'Restaurants & Cafés', quantity: 1, budget: 100, deadline: future(), publish: true })).data;
     await call('POST', `/rfqs/${rf.id}/quotes`, supTok, { price });
     const q = await db.quote.findFirst({ where: { rfqId: rf.id } });
     await call('POST', `/quotes/${q.id}/award`, buyerTok, {});
@@ -476,7 +476,7 @@ async function newRfq(budget = 500, extra = {}) {
   const p5 = (await call('POST', `/invoices/${i5.id}/payments`, B5, { amount: 80, method: 'bank_transfer' })).data.payment;
   await call('PATCH', `/payments/${p5.id}/confirm`, S5, {});
   await db.wallet.update({ where: { companyId: 'sup1' }, data: { balance: 100 } });
-  const open5 = (await call('POST', '/rfqs', B5, { title: 'buyer5 open', description: 'x', quantity: 1, budget: 200, deadline: future(), publish: true })).data;
+  const open5 = (await call('POST', '/rfqs', B5, { title: 'buyer5 open', description: 'x', category: 'Restaurants & Cafés', quantity: 1, budget: 200, deadline: future(), publish: true })).data;
   await call('POST', `/rfqs/${open5.id}/quotes`, S1, { price: 150 }); // sup1 pays 10
   r = await call('DELETE', '/admin/companies/buyer5', ADM);
   check('delete buyer5 with trading history -> anonymized', r.status === 200 && r.data.mode === 'anonymized', r.data);
@@ -566,7 +566,7 @@ async function newRfq(budget = 500, extra = {}) {
   check('not verified: name change keeps PENDING', r.data.reverificationRequired === false && (await coStatus('sup8')) === 'PENDING');
 
   console.log('\n== 15. M12 budget required to publish, M13 order rows show LPO and counterparty ==');
-  const noBudget = { title: 'nb', description: 'x', quantity: 5, deadline: future() };
+  const noBudget = { title: 'nb', description: 'x', category: 'Restaurants & Cafés', quantity: 5, deadline: future() };
   r = await call('POST', '/rfqs', B1, { ...noBudget, publish: true });
   check('publish without budget -> 400', r.status === 400 && /budget is required/.test(r.data.error), r.data);
   r = await call('POST', '/rfqs', B1, noBudget);
@@ -653,7 +653,7 @@ async function newRfq(budget = 500, extra = {}) {
   check('non-admin cannot fetch documents -> 403', (await call('GET', `/admin/companies/sup9/documents/${pdfId}`, S9)).status === 403);
 
   await db.wallet.update({ where: { companyId: 'sup2' }, data: { balance: 100 } });
-  const nq = (await call('POST', '/rfqs', B1, { title: 'Office desks', description: 'x', quantity: 1, budget: 100, deadline: future(), publish: true })).data;
+  const nq = (await call('POST', '/rfqs', B1, { title: 'Office desks', description: 'x', category: 'Restaurants & Cafés', quantity: 1, budget: 100, deadline: future(), publish: true })).data;
   const notesBefore = await db.notification.count({ where: { companyId: 'buyer1', type: 'NEW_QUOTE' } });
   check('supplier quotes -> 201', (await call('POST', `/rfqs/${nq.id}/quotes`, S2, { price: 64.5 })).status === 201);
   await new Promise((res) => setTimeout(res, 150)); // notify() runs right after the response
@@ -1579,7 +1579,7 @@ async function newRfq(budget = 500, extra = {}) {
   check('publish without quantity -> 400', r.status === 400 && /quantity/.test(r.data.error), r.data);
   check('publish with quantity 0 or 2.5 -> 400', (await call('POST', '/rfqs', B1, { title: 'q0', description: 'x', budget: 50, quantity: 0, deadline: future(), publish: true })).status === 400 &&
     (await call('POST', '/rfqs', B1, { title: 'q25', description: 'x', budget: 50, quantity: 2.5, deadline: future(), publish: true })).status === 400);
-  const qDraft = (await call('POST', '/rfqs', B1, { title: 'draft no qty', description: 'x', budget: 50, deadline: future() })).data;
+  const qDraft = (await call('POST', '/rfqs', B1, { title: 'draft no qty', description: 'x', category: 'Restaurants & Cafés', budget: 50, deadline: future() })).data;
   check('draft without quantity -> allowed', qDraft && qDraft.status === 'DRAFT');
   check('publishing that draft -> 400 until a quantity is set', (await call('PATCH', `/rfqs/${qDraft.id}`, B1, { status: 'PUBLISHED' })).status === 400 &&
     (await call('PATCH', `/rfqs/${qDraft.id}`, B1, { status: 'PUBLISHED', quantity: 4 })).status === 200);
@@ -1616,6 +1616,36 @@ async function newRfq(budget = 500, extra = {}) {
   check('deactivated company: items hidden', !(await seenBy(B1, 'cat1 item')));
   await setCat1({ isActive: true, verificationStatus: 'PENDING' });
   check('unverified supplier can still delete its own item', (await call('DELETE', `/catalog/${cat1Item.id}`, C1)).status === 204);
+
+  console.log('\n== 18c12. stage 4: one active category, the rest coming soon ==');
+  const catBody = (category, extra = {}) => ({ title: 'cat test', description: 'x', quantity: 2, budget: 40, deadline: future(), publish: true, ...(category === undefined ? {} : { category }), ...extra });
+  r = await call('POST', '/rfqs', B1, catBody('Restaurants & Cafés'));
+  check('active category "Restaurants & Cafés" -> 201', r.status === 201 && r.data.category === 'Restaurants & Cafés', r.data);
+  r = await call('POST', '/rfqs', B1, catBody('Restaurant Groceries'));
+  check('old name "Restaurant Groceries" -> stored as "Restaurants & Cafés"', r.status === 201 && r.data.category === 'Restaurants & Cafés', r.data);
+  for (const c of ['Beauty & Salons', 'Construction', 'Generators & Machinery', 'Rental Cars', 'Office & Facilities', 'General']) {
+    r = await call('POST', '/rfqs', B1, catBody(c));
+    check(`coming-soon category "${c}" -> 400`, r.status === 400 && /coming soon/.test(r.data.error), r.data);
+  }
+  check('unknown category -> 400', (await call('POST', '/rfqs', B1, catBody('Weapons'))).status === 400 && (await call('POST', '/rfqs', B1, catBody('general'))).status === 400);
+  r = await call('POST', '/rfqs', B1, catBody(undefined));
+  check('publish without a category -> 400', r.status === 400 && /category is required/.test(r.data.error), r.data);
+  const catDraft = (await call('POST', '/rfqs', B1, catBody(undefined, { publish: false }))).data;
+  check('draft without a category -> allowed, publishing it -> 400 until one is set', catDraft.status === 'DRAFT' &&
+    (await call('PATCH', `/rfqs/${catDraft.id}`, B1, { status: 'PUBLISHED' })).status === 400 &&
+    (await call('PATCH', `/rfqs/${catDraft.id}`, B1, { status: 'PUBLISHED', category: 'Construction' })).status === 400 &&
+    (await call('PATCH', `/rfqs/${catDraft.id}`, B1, { status: 'PUBLISHED', category: 'Restaurants & Cafés' })).status === 200);
+  const legacyDraft = await db.rFQ.create({ data: { buyerCompanyId: 'buyer1', title: 'legacy cat', description: 'x', quantity: 1, budget: 10, category: 'Restaurant Groceries', status: 'DRAFT', deadline: new Date(Date.now() + 86400e3) } });
+  r = await call('PATCH', `/rfqs/${legacyDraft.id}`, B1, { status: 'PUBLISHED' });
+  check('publishing a draft stored with the old name -> published under the new name', r.status === 200 && r.data.category === 'Restaurants & Cafés', r.data);
+  const staleCat = await db.rFQ.create({ data: { buyerCompanyId: 'buyer1', title: 'stale cat', description: 'x', quantity: 1, budget: 10, category: 'Rental Cars', status: 'DRAFT', deadline: new Date(Date.now() + 86400e3) } });
+  check('draft stored in a coming-soon category cannot be published -> 400', (await call('PATCH', `/rfqs/${staleCat.id}`, B1, { status: 'PUBLISHED' })).status === 400);
+  // migration 8 renames stored RFQs
+  const m8 = await db.rFQ.create({ data: { buyerCompanyId: 'buyer1', title: 'm8', description: 'x', category: 'Restaurant Groceries', status: 'AWARDED' } });
+  const m8sql = require('fs').readFileSync(path.join(root, 'prisma/migrations/8_rename_active_category/migration.sql'), 'utf8').split('\n').filter((l) => !l.startsWith('--')).join('\n');
+  await db.$executeRawUnsafe(m8sql);
+  check('migration 8: stored "Restaurant Groceries" -> "Restaurants & Cafés", others untouched', (await db.rFQ.findUnique({ where: { id: m8.id } })).category === 'Restaurants & Cafés' &&
+    (await db.rFQ.findUnique({ where: { id: staleCat.id } })).category === 'Rental Cars');
 
   console.log('\n== 18d. L6 change-password attempts limited per user ==');
   await mkCo('sup11', 'SUPPLIER', 0); await mkCo('sup12', 'SUPPLIER', 0);
