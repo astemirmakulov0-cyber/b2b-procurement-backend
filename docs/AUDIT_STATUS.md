@@ -1,6 +1,6 @@
 # Статус аудита Biddex
 
-Обновлено: 2026-09-25 (M7, L6, L9 закрыты; приёмка товара покупателем; L4 — этапы 1–2). Бэкенд — этот репозиторий (`b2b-backend/`), фронтенд — репозиторий `Biddex-frontend` (`app.biddex.online`).
+Обновлено: 2026-09-25 (M7, L6, L9 закрыты; приёмка товара покупателем; L4 — этапы 1–3). Бэкенд — этот репозиторий (`b2b-backend/`), фронтенд — репозиторий `Biddex-frontend` (`app.biddex.online`).
 
 ## Закрыто
 
@@ -20,7 +20,7 @@
 
 ## Осталось
 
-- **L4 (этапы 1–2 сделаны)** — выбрано приватное хранилище Railway Storage Buckets (S3-совместимое, `src/utils/storage.js`, переменные `S3_*`). Сделано: документы заказа (накладные, инвойсы, прочее; `OrderDocument`), загрузка через API (до 10 МБ, PDF/JPEG/PNG/WebP по содержимому), скачивание по presigned URL на 120 с только сторонам заказа и админу, мягкое удаление (объекты не перезаписываются и не удаляются). Этап 2: вложения к ставкам (`QuoteAttachment`, до 5 файлов по 10 МБ) — видят только поставщик, покупатель RFQ и админ (остальным 404, количество не раскрывается); менять можно, пока ставка SUBMITTED и приём ставок открыт; при принятии LPO вложения выигравшей ставки становятся документами заказа (`QUOTE_ATTACHMENT`, тот же объект в бакете). Осталось отдельными задачами: перенос картинок каталога и документов верификации из data URL в базе (на сервере `imageUrl` каталога сейчас не проверяется); резервная копия бакета во второй бакет — до прихода реальных пользователей (у Railway Buckets нет бэкапов и версионирования).
+- **L4 (этапы 1–3 сделаны)** — выбрано приватное хранилище Railway Storage Buckets (S3-совместимое, `src/utils/storage.js`, переменные `S3_*`). Сделано: документы заказа (накладные, инвойсы, прочее; `OrderDocument`), загрузка через API (до 10 МБ, PDF/JPEG/PNG/WebP по содержимому), скачивание по presigned URL на 120 с только сторонам заказа и админу, мягкое удаление (объекты не перезаписываются и не удаляются). Этап 2: вложения к ставкам (`QuoteAttachment`, до 5 файлов по 10 МБ) — видят только поставщик, покупатель RFQ и админ (остальным 404, количество не раскрывается); менять можно, пока ставка SUBMITTED и приём ставок открыт; при принятии LPO вложения выигравшей ставки становятся документами заказа (`QUOTE_ATTACHMENT`, тот же объект в бакете). Этап 3: фото каталога и документы верификации — новые загрузки идут в бакет (серверная проверка `imageUrl`: только JPEG/PNG/WebP data URL до 2 МБ по содержимому); фото отдаются presigned-ссылкой (подписана на начало часа, действует 2 ч), документы — только админу, ссылкой на 120 с для просмотра; старые записи переносит `scripts/migrate-files-to-bucket.js` (см. «Перенос файлов в бакет»). Осталось: очистка data URL на проде (через несколько дней после переноса); резервная копия бакета во второй бакет — до прихода реальных пользователей (у Railway Buckets нет бэкапов и версионирования).
 
 **Заметки по ходу**
 - `verificationToken` хранится открытым текстом (риск ниже, чем у токена сброса).
@@ -33,6 +33,19 @@
 - `embedded-postgres` для тестов — beta-версия (стабильной 17-й нет).
 - Pre-deploy `prisma migrate deploy` в Railway не включён — миграции применяются вручную (см. ниже).
 
+## Перенос файлов в бакет (L4, этап 3)
+
+- Скрипт `b2b-backend/scripts/migrate-files-to-bucket.js`: без флагов — dry-run (ничего не меняет), `--apply` — перенос (data URL остаются, повторный запуск пропускает перенесённое), `--verify` — проверка файлов в бакете, `--cleanup` / `--cleanup --apply` — очистка data URL только у проверенных записей, `--clear-invalid-images` / `... --apply` — очистка `imageUrl`, которые не являются фото (ссылки и т.п.).
+- Против прода: `.env.production` должен содержать `DATABASE_URL` и `S3_ENDPOINT`, `S3_REGION`, `S3_BUCKET`, `S3_ACCESS_KEY_ID`, `S3_SECRET_ACCESS_KEY` (из вкладки Credentials бакета). Переменные передаются только на одну команду:
+  ```bash
+  cd b2b-backend
+  DOTENV_CONFIG_PATH=.env.production node -r dotenv/config scripts/migrate-files-to-bucket.js            # dry-run
+  DOTENV_CONFIG_PATH=.env.production node -r dotenv/config scripts/migrate-files-to-bucket.js --apply
+  DOTENV_CONFIG_PATH=.env.production node -r dotenv/config scripts/migrate-files-to-bucket.js --verify
+  ```
+  Скрипт печатает хост базы и имя бакета — проверить перед `--apply`.
+- Порядок: миграция `6_files_to_bucket` → выкатка кода → dry-run → `--apply` → `--verify` → проверка в интерфейсе → через несколько дней `--cleanup` (dry-run) → `--cleanup --apply`. После очистки код нельзя откатывать на версию до миграции 6 (старая версия не прочтёт документы без `fileUrl`).
+
 ## База данных и миграции
 
 - **Прод-URL** хранится только в `b2b-backend/.env.production` (в git не попадает: `.gitignore` исключает `.env.*`, кроме `.env.example`). `b2b-backend/.env` указывает на **локальную** базу, поэтому команды по умолчанию до прода не достают.
@@ -41,7 +54,7 @@
   cd b2b-backend
   DATABASE_URL="$(node -e "require('dotenv').config({path:'.env.production'});process.stdout.write(process.env.DATABASE_URL)")" npx prisma migrate status
   ```
-- Схема меняется только через `b2b-backend/prisma/migrations` (baseline `0_init` = схема прода на 2026-09-24, затем `1_l2_l3`, `2_order_status_before_dispute`, `3_order_received_at`, `4_order_documents`, `5_quote_attachments`). **`prisma db push` больше не используется.**
+- Схема меняется только через `b2b-backend/prisma/migrations` (baseline `0_init` = схема прода на 2026-09-24, затем `1_l2_l3`, `2_order_status_before_dispute`, `3_order_received_at`, `4_order_documents`, `5_quote_attachments`, `6_files_to_bucket`). **`prisma db push` больше не используется.**
 - **Railway**: Custom Start Command — `npm start` (до 2026-09-24 там был `prisma db push --accept-data-loss`, каждый деплой применял схему). Pre-deploy-команды нет.
 - Порядок изменения схемы:
   1. изменить `schema.prisma`, локально `npm run migrate:new -- --name <что_меняем>`, прочитать и при необходимости поправить `migration.sql` (Prisma генерирует `DROP/ADD COLUMN` при смене типа — переписывать на безопасный `ALTER`);

@@ -4,7 +4,9 @@ const crypto = require('crypto');
 const asyncHandler = require('../utils/asyncHandler');
 const { notify } = require('../utils/notify');
 const { CANCELLABLE_STATUSES, cancelRfqInTx } = require('../utils/rfqCancel');
+const Sentry = require('@sentry/node');
 const { DOC_TYPES, checkDocument, DOC_META } = require('../utils/documents');
+const storage = require('../utils/storage');
 
 // GET /api/companies/me
 const getMyCompany = asyncHandler(async (req, res) => {
@@ -44,17 +46,29 @@ const updateMyCompany = asyncHandler(async (req, res) => {
   res.json({ ...company, reverificationRequired: reverify });
 });
 
-// POST /api/companies/me/documents
+// POST /api/companies/me/documents   body: { fileUrl: data: URL, docType }
+// The file is checked (PDF or raster image by content, under 2MB) and stored in the private bucket;
+// only admins can open it (GET /api/admin/companies/:id/documents/:docId).
 const addDocument = asyncHandler(async (req, res) => {
   const { fileUrl, docType } = req.body;
   if (!fileUrl || !docType) return res.status(400).json({ error: 'fileUrl and docType required' });
   if (!DOC_TYPES.includes(docType)) return res.status(400).json({ error: 'docType must be one of ' + DOC_TYPES.join(', ') });
   const checked = checkDocument(fileUrl);
   if (checked.error) return res.status(400).json({ error: checked.error });
+  if (!storage.isConfigured()) return res.status(503).json({ error: 'File storage is not configured' });
+
+  const storageKey = storage.newKey('companies/' + req.user.companyId);
+  try {
+    await storage.putObject(storageKey, checked.buffer, checked.contentType);
+  } catch (err) {
+    Sentry.captureException(err, { tags: { area: 'storage' }, extra: { companyId: req.user.companyId, storageKey } });
+    console.error('storage put failed:', err.message);
+    return res.status(502).json({ error: 'Could not store the file, please try again' });
+  }
 
   const doc = await prisma.$transaction(async (tx) => {
     const created = await tx.companyDocument.create({
-      data: { companyId: req.user.companyId, fileUrl, docType },
+      data: { companyId: req.user.companyId, docType, storageKey, contentType: checked.contentType, sizeBytes: checked.buffer.length },
       select: DOC_META,
     });
     // a new document puts an unverified/rejected company into the admin's queue; it doesn't
@@ -68,12 +82,19 @@ const addDocument = asyncHandler(async (req, res) => {
   res.status(201).json(doc);
 });
 
-// GET /api/admin/companies/:id/documents/:docId  (admin) - one document with its file, for review
+// GET /api/admin/companies/:id/documents/:docId  (admin) - one document for review:
+// { id, docType, uploadedAt, contentType, url } — url shows the file in the page for 120 seconds.
+// Documents not yet moved to the bucket still come as { ..., fileUrl: data: URL }.
 const getCompanyDocument = asyncHandler(async (req, res) => {
   const doc = await prisma.companyDocument.findFirst({ where: { id: req.params.docId, companyId: req.params.id } });
   if (!doc) return res.status(404).json({ error: 'Document not found' });
   res.set('Cache-Control', 'no-store');
-  res.json(doc);
+  const meta = { id: doc.id, companyId: doc.companyId, docType: doc.docType, uploadedAt: doc.uploadedAt };
+  if (doc.storageKey) {
+    if (!storage.isConfigured()) return res.status(503).json({ error: 'File storage is not configured' });
+    return res.json({ ...meta, contentType: doc.contentType, url: await storage.presignView(doc.storageKey, doc.contentType), expiresIn: storage.DOWNLOAD_URL_TTL_SECONDS });
+  }
+  res.json({ ...meta, fileUrl: doc.fileUrl });
 });
 
 // GET /api/admin/companies?status=PENDING

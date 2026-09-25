@@ -67,6 +67,36 @@ async function newRfq(budget = 500, extra = {}) {
   await new Promise((r) => setTimeout(r, 800));
   await seed();
   const B1 = tok('BUYER', 'buyer1'), B2 = tok('BUYER', 'buyer2'), S1 = tok('SUPPLIER', 'sup1'), S2 = tok('SUPPLIER', 'sup2'), S3 = tok('SUPPLIER', 'sup3'), ADM = tok('ADMIN', null);
+  // A minimal local S3 stand-in: stores PUT objects in memory, serves them to presigned GETs (the signature
+  // itself isn't verified; what the SDK sends and what the presigned URL asks for is checked below).
+  const http = require('http');
+  const s3Store = new Map();
+  let s3Fail = false;
+  const lastGets = [];
+  const s3Server = http.createServer((q, res) => {
+    const u = new URL(q.url, 'http://x');
+    if (q.method === 'PUT') {
+      const chunks = [];
+      q.on('data', (c) => chunks.push(c));
+      q.on('end', () => {
+        if (s3Fail) { res.writeHead(500); return res.end('<Error><Code>InternalError</Code></Error>'); }
+        s3Store.set(decodeURIComponent(u.pathname), { body: Buffer.concat(chunks), contentType: q.headers['content-type'], headers: q.headers });
+        res.writeHead(200, { ETag: '"etag"' }); res.end();
+      });
+      return;
+    }
+    const obj = s3Store.get(decodeURIComponent(u.pathname));
+    lastGets.push(u);
+    if (!obj || !['GET', 'HEAD'].includes(q.method)) { res.writeHead(404); return res.end(); }
+    if (q.method === 'HEAD') { res.writeHead(200, { 'Content-Length': obj.body.length, 'Content-Type': obj.contentType }); return res.end(); }
+    res.writeHead(200, { 'Content-Type': u.searchParams.get('response-content-type') || obj.contentType, 'Content-Disposition': u.searchParams.get('response-content-disposition') || '' });
+    res.end(obj.body);
+  });
+  await new Promise((resolve) => s3Server.listen(0, '127.0.0.1', resolve));
+  // storage is configured from the start (documents and catalog photos go to the bucket); a test unsets it to check 503
+  const S3_ENV = { S3_ENDPOINT: `http://127.0.0.1:${s3Server.address().port}`, S3_REGION: 'auto', S3_BUCKET: 'test-bucket',
+    S3_ACCESS_KEY_ID: 'test-key', S3_SECRET_ACCESS_KEY: 'test-secret', S3_FORCE_PATH_STYLE: 'true' };
+  Object.assign(process.env, S3_ENV);
 
   console.log('\n== 1. role check before JSON validation ==');
   check('supplier + malformed JSON -> 403', (await call('POST', '/wallet/topup', S1, null, '{amount:20}')).status === 403);
@@ -579,7 +609,7 @@ async function newRfq(budget = 500, extra = {}) {
 
   console.log('\n== 17. M15 verification documents, L9 new-quote notification ==');
   const PDF = 'data:application/pdf;base64,' + Buffer.from('%PDF-1.4 test document').toString('base64');
-  const PNG = 'data:image/png;base64,' + Buffer.from([0x89, 0x50, 0x4e, 0x47, 1, 2, 3]).toString('base64');
+  const PNG = 'data:image/png;base64,' + Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a, 1, 2, 3]).toString('base64');
   await mkCo('sup9', 'SUPPLIER', 100);
   await db.company.update({ where: { id: 'sup9' }, data: { verificationStatus: 'PENDING' } });
   const S9 = tok('SUPPLIER', 'sup9');
@@ -603,8 +633,22 @@ async function newRfq(budget = 500, extra = {}) {
   check('GET /auth/me: documents without file content', noContent((await call('GET', '/auth/me', S9)).data.company.documents));
   const adminRow = (await call('GET', '/admin/companies', ADM)).data.find((x) => x.id === 'sup9');
   check('admin list: 2 documents, no file content', adminRow && adminRow.documents.length === 2 && noContent(adminRow.documents));
+  const pdfRow = await db.companyDocument.findUnique({ where: { id: pdfId } });
+  check('document stored in the bucket, no data: URL in the DB', pdfRow.fileUrl === null && pdfRow.storageKey.startsWith('companies/sup9/') && pdfRow.contentType === 'application/pdf' &&
+    s3Store.get('/test-bucket/' + pdfRow.storageKey).body.equals(Buffer.from('%PDF-1.4 test document')), pdfRow);
   r = await call('GET', `/admin/companies/sup9/documents/${pdfId}`, ADM);
-  check('admin fetches one document with its file', r.status === 200 && r.data.fileUrl === PDF, r.status);
+  const dv = r.status === 200 && new URL(r.data.url);
+  check('admin gets a 120 s link that shows the document inline', r.status === 200 && r.data.contentType === 'application/pdf' && !('fileUrl' in r.data) && !('storageKey' in r.data) &&
+    dv.searchParams.get('X-Amz-Expires') === '120' && dv.searchParams.get('response-content-disposition') === 'inline' && dv.pathname === '/test-bucket/' + pdfRow.storageKey, r.data);
+  check('the link serves the document', Buffer.from(await (await fetch(r.data.url)).arrayBuffer()).equals(Buffer.from('%PDF-1.4 test document')));
+  const legacyDoc = await db.companyDocument.create({ data: { companyId: 'sup9', docType: 'OTHER', fileUrl: PDF } });
+  r = await call('GET', `/admin/companies/sup9/documents/${legacyDoc.id}`, ADM);
+  check('a document not yet moved still comes as its data: URL', r.status === 200 && r.data.fileUrl === PDF && !r.data.url, r.data);
+  await db.companyDocument.delete({ where: { id: legacyDoc.id } });
+  check('DB refuses a document without any file (CHECK)', await db.companyDocument.create({ data: { companyId: 'sup9', docType: 'OTHER' } }).then(() => false, () => true));
+  const gif = 'data:image/gif;base64,' + Buffer.from('GIF89a\x01\x00\x01\x00').toString('base64');
+  check('GIF verification document still accepted', (await addDoc(gif, 'OTHER')).status === 201);
+  check('PNG declared, SVG content -> 400', (await addDoc('data:image/png;base64,' + Buffer.from('<svg xmlns="http://www.w3.org/2000/svg"/>').toString('base64'))).status === 400);
   check('document id under another company -> 404', (await call('GET', `/admin/companies/sup1/documents/${pdfId}`, ADM)).status === 404);
   check('non-admin cannot fetch documents -> 403', (await call('GET', `/admin/companies/sup9/documents/${pdfId}`, S9)).status === 403);
 
@@ -963,31 +1007,6 @@ async function newRfq(budget = 500, extra = {}) {
   }
 
   console.log('\n== 18c5. L4 order documents in private storage ==');
-  // A minimal local S3 stand-in: stores PUT objects in memory, serves them to presigned GETs (the signature
-  // itself isn't verified; what the SDK sends and what the presigned URL asks for is checked below).
-  const http = require('http');
-  const s3Store = new Map();
-  let s3Fail = false;
-  const lastGets = [];
-  const s3Server = http.createServer((q, res) => {
-    const u = new URL(q.url, 'http://x');
-    if (q.method === 'PUT') {
-      const chunks = [];
-      q.on('data', (c) => chunks.push(c));
-      q.on('end', () => {
-        if (s3Fail) { res.writeHead(500); return res.end('<Error><Code>InternalError</Code></Error>'); }
-        s3Store.set(decodeURIComponent(u.pathname), { body: Buffer.concat(chunks), contentType: q.headers['content-type'], headers: q.headers });
-        res.writeHead(200, { ETag: '"etag"' }); res.end();
-      });
-      return;
-    }
-    const obj = s3Store.get(decodeURIComponent(u.pathname));
-    lastGets.push(u);
-    if (q.method !== 'GET' || !obj) { res.writeHead(404); return res.end(); }
-    res.writeHead(200, { 'Content-Type': u.searchParams.get('response-content-type') || obj.contentType, 'Content-Disposition': u.searchParams.get('response-content-disposition') || '' });
-    res.end(obj.body);
-  });
-  await new Promise((resolve) => s3Server.listen(0, '127.0.0.1', resolve));
 
   const PDF_BYTES = Buffer.concat([Buffer.from('%PDF-1.4\n'), Buffer.alloc(2000, 0x20), Buffer.from('\n%%EOF')]);
   const PNG_BYTES = Buffer.concat([Buffer.from([0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a]), Buffer.alloc(100, 1)]);
@@ -1004,10 +1023,10 @@ async function newRfq(budget = 500, extra = {}) {
   const docRows = (orderId) => db.orderDocument.count({ where: { orderId } });
 
   let dso = await makeOrder(90, S2, 'sup2');
+  for (const k of Object.keys(S3_ENV)) delete process.env[k];
   r = await upload(dso.order.id, S2, { kind: 'DELIVERY_NOTE', file: PDF_BYTES });
+  Object.assign(process.env, S3_ENV);
   check('storage not configured -> 503, nothing stored', r.status === 503 && (await docRows(dso.order.id)) === 0, r.data);
-  Object.assign(process.env, { S3_ENDPOINT: `http://127.0.0.1:${s3Server.address().port}`, S3_REGION: 'auto', S3_BUCKET: 'test-bucket',
-    S3_ACCESS_KEY_ID: 'test-key', S3_SECRET_ACCESS_KEY: 'test-secret', S3_FORCE_PATH_STYLE: 'true' });
 
   r = await upload(dso.order.id, S2, { kind: 'DELIVERY_NOTE', file: PDF_BYTES, name: 'Delivery note 0042.pdf' });
   const dn = r.data;
@@ -1027,7 +1046,7 @@ async function newRfq(budget = 500, extra = {}) {
   check('buyer adds another document (PNG_BYTES) -> 201', r.status === 201 && r.data.contentType === 'image/png' && r.data.uploadedByCompany.name === 'Co buyer1', r.data);
   const buyerDocId = r.data.id;
   check('supplier adds an invoice -> 201', (await upload(dso.order.id, S2, { kind: 'INVOICE', file: PDF_BYTES, name: 'INV-7.pdf' })).status === 201);
-  const rowsNow = await docRows(dso.order.id);
+  const rowsNow = await docRows(dso.order.id), storeNow = s3Store.size;
   check('bad kind -> 400', (await upload(dso.order.id, S2, { kind: 'RECEIPT', file: PDF_BYTES })).status === 400);
   check('missing kind -> 400', (await upload(dso.order.id, S2, { file: PDF_BYTES })).status === 400);
   check('no file -> 400', (await upload(dso.order.id, S2, { kind: 'OTHER' })).status === 400);
@@ -1040,7 +1059,7 @@ async function newRfq(budget = 500, extra = {}) {
   check('file over 10 MB -> 413', r.status === 413 && /at most 10 MB/.test(r.data.error), r.data);
   check('two files in one request -> 400', (await upload(dso.order.id, S2, { kind: 'OTHER', file: PDF_BYTES, extra: (f) => f.append('file', new Blob([PDF_BYTES]), 'b.pdf') })).status === 400);
   check('JSON instead of multipart -> 400', (await call('POST', `/orders/${dso.order.id}/documents`, S2, { kind: 'OTHER' })).status === 400);
-  check('...rejected uploads stored nothing', (await docRows(dso.order.id)) === rowsNow && s3Store.size === rowsNow);
+  check('...rejected uploads stored nothing', (await docRows(dso.order.id)) === rowsNow && s3Store.size === storeNow);
   r = await upload(dso.order.id, S2, { kind: 'OTHER', file: JPG_BYTES, name: 'photo' });
   check('JPEG without extension -> name gets .jpg', r.status === 201 && r.data.fileName === 'photo.jpg', r.data);
   r = await upload(dso.order.id, S2, { kind: 'OTHER', file: PDF_BYTES, name: '..\\..\\etc/passwd.pdf' });
@@ -1220,6 +1239,105 @@ async function newRfq(budget = 500, extra = {}) {
   await uploadAtt(hq.id, S13);
   r = await call('DELETE', '/admin/companies/sup13', ADM);
   check('delete supplier with attachments, no trading history -> deleted, rows gone', r.status === 200 && r.data.mode === 'deleted' && (await db.quoteAttachment.count({ where: { quoteId: hq.id } })) === 0, r.data);
+
+  console.log('\n== 18c7. L4 catalog photos in the bucket, imageUrl validation, migration script ==');
+  const dataUrl = (type, buf) => `data:${type};base64,${buf.toString('base64')}`;
+  const JPG_URL = dataUrl('image/jpeg', JPG_BYTES);
+  const addItem = (body, tokn = S1) => call('POST', '/catalog', tokn, { price: 2, ...body });
+  r = await addItem({ name: 'L4 photo item', imageUrl: JPG_URL });
+  const itemRow = r.status === 201 && await db.catalogItem.findUnique({ where: { id: r.data.id } });
+  const iu = r.status === 201 && new URL(r.data.imageUrl);
+  check('item with a JPEG photo -> 201, photo in the bucket, no data: URL stored', r.status === 201 && itemRow.imageUrl === null && itemRow.imageKey.startsWith('catalog/sup1/') &&
+    itemRow.imageContentType === 'image/jpeg' && s3Store.get('/test-bucket/' + itemRow.imageKey).body.equals(JPG_BYTES), itemRow);
+  check('...response: imageUrl is a presigned link (2 h), no key', !('imageKey' in r.data) && !('imageContentType' in r.data) && iu.searchParams.get('X-Amz-Expires') === '7200' &&
+    iu.pathname === '/test-bucket/' + itemRow.imageKey && /T\d\d0000Z$/.test(iu.searchParams.get('X-Amz-Date')), r.data.imageUrl);
+  const listed1 = (await call('GET', '/catalog', B2)).data.find((i) => i.id === itemRow.id);
+  const listed2 = (await call('GET', '/catalog', B2)).data.find((i) => i.id === itemRow.id);
+  check('catalog list: same photo link on repeated requests (cacheable)', listed1.imageUrl === listed2.imageUrl && listed1.imageUrl === r.data.imageUrl && !('imageKey' in listed1));
+  check('...the link serves the photo', Buffer.from(await (await fetch(listed1.imageUrl)).arrayBuffer()).equals(JPG_BYTES));
+  const storageMod = require(path.join(root, 'src/utils/storage'));
+  const hourStart = Math.floor(Date.now() / 3600e3) * 3600e3;
+  const [u1, u2, u3] = await Promise.all([hourStart + 60e3, hourStart + 59 * 60e3, hourStart + 61 * 60e3].map((t) => storageMod.presignStable('k', 'image/jpeg', t)));
+  check('photo links: stable within the hour, new in the next hour', u1 === u2 && u1 !== u3);
+  for (const [value, why] of [['https://evil.example/x.jpg', 'remote link'], ['javascript:alert(1)', 'javascript: URL'], [dataUrl('image/svg+xml', Buffer.from('<svg onload="alert(1)"/>')), 'SVG'],
+    [dataUrl('image/png', Buffer.from('<html><script>alert(1)</script></html>')), 'HTML declared as PNG'], [dataUrl('application/pdf', PDF_BYTES), 'PDF'],
+    ['data:image/jpeg;base64,' + 'A'.repeat(2.9 * 1024 * 1024), 'over 2MB'], [JPG_URL + '"x', 'broken base64'], [12345, 'not a string']]) {
+    r = await addItem({ name: 'L4 bad ' + why, imageUrl: value });
+    check(`catalog photo ${why} -> 400, no item`, r.status === 400 && (await db.catalogItem.count({ where: { name: 'L4 bad ' + why } })) === 0, r.data);
+  }
+  r = await addItem({ name: 'L4 png declared jpeg content', imageUrl: dataUrl('image/png', JPG_BYTES) });
+  check('declared PNG with JPEG content -> stored as image/jpeg', r.status === 201 && (await db.catalogItem.findUnique({ where: { id: r.data.id } })).imageContentType === 'image/jpeg');
+  check('item without a photo -> 201', (await addItem({ name: 'L4 no photo', imageUrl: '' })).status === 201);
+  for (const k of Object.keys(S3_ENV)) delete process.env[k];
+  const noStorage = await addItem({ name: 'L4 no storage', imageUrl: JPG_URL });
+  const noStorageDoc = await call('POST', '/companies/me/documents', S1, { fileUrl: dataUrl('application/pdf', PDF_BYTES), docType: 'OTHER' });
+  Object.assign(process.env, S3_ENV);
+  check('photo / document without storage configured -> 503, nothing saved', noStorage.status === 503 && noStorageDoc.status === 503 && (await db.catalogItem.count({ where: { name: 'L4 no storage' } })) === 0);
+  s3Fail = true;
+  const failed = await addItem({ name: 'L4 storage down', imageUrl: JPG_URL });
+  s3Fail = false;
+  check('storage failure -> 502, no item', failed.status === 502 && (await db.catalogItem.count({ where: { name: 'L4 storage down' } })) === 0);
+
+  // the migration script, against this database and the local S3 stand-in
+  const { execFile } = require('child_process');
+  const runScript = (...args) => new Promise((resolve) => execFile(process.execPath, [path.join(root, 'scripts/migrate-files-to-bucket.js'), ...args],
+    { cwd: root, env: { ...process.env, ...S3_ENV } }, (err, stdout, stderr) => resolve({ code: err ? err.code : 0, out: stdout + stderr })));
+  const PNG_URL = dataUrl('image/png', PNG_BYTES);
+  const GIF_BYTES = Buffer.from('GIF89a\x01\x00\x01\x00\x00\x00\x00', 'latin1');
+  const legacyItems = await Promise.all([
+    db.catalogItem.create({ data: { supplierCompanyId: 'sup2', name: 'legacy jpg', price: 1, imageUrl: JPG_URL } }),
+    db.catalogItem.create({ data: { supplierCompanyId: 'sup2', name: 'legacy png', price: 1, imageUrl: PNG_URL } }),
+    db.catalogItem.create({ data: { supplierCompanyId: 'sup2', name: 'legacy link', price: 1, imageUrl: 'https://example.com/tracker.jpg' } }),
+    db.catalogItem.create({ data: { supplierCompanyId: 'sup2', name: 'legacy js', price: 1, imageUrl: 'javascript:alert(1)' } }),
+  ]);
+  const legacyDocs = await Promise.all([
+    db.companyDocument.create({ data: { companyId: 'sup2', docType: 'TRADE_LICENSE', fileUrl: dataUrl('application/pdf', PDF_BYTES) } }),
+    db.companyDocument.create({ data: { companyId: 'sup2', docType: 'OTHER', fileUrl: dataUrl('image/gif', GIF_BYTES) } }),
+  ]);
+  const itemNow = (i) => db.catalogItem.findUnique({ where: { id: legacyItems[i].id } });
+  const docNow = (i) => db.companyDocument.findUnique({ where: { id: legacyDocs[i].id } });
+  const storeSize = s3Store.size;
+
+  r = await runScript();
+  check('dry run: exit 0, reports 2 photos + 2 documents to move and 2 invalid photos', r.code === 0 && /Mode: move \(dry run/.test(r.out) &&
+    /catalog photos:[\s\S]*to move: 2 \(/.test(r.out) && /verification documents:[\s\S]*to move: 2 \(/.test(r.out) && /not a valid file, left as is: 2/.test(r.out), r.out);
+  check('...dry run changed nothing', (await itemNow(0)).imageKey === null && (await docNow(0)).storageKey === null && s3Store.size === storeSize);
+  r = await runScript('--apply');
+  const m0 = await itemNow(0), m1 = await itemNow(1), d0 = await docNow(0), d1 = await docNow(1);
+  check('--apply: 2 photos + 2 documents moved', r.code === 0 && (r.out.match(/moved: 2 \(/g) || []).length === 2, r.out);
+  check('...keys recorded, data: URLs kept, files identical in the bucket', m0.imageKey && m0.imageUrl === JPG_URL && m1.imageContentType === 'image/png' && d0.storageKey && d0.fileUrl && d1.contentType === 'image/gif' &&
+    d1.sizeBytes === GIF_BYTES.length && s3Store.get('/test-bucket/' + m0.imageKey).body.equals(JPG_BYTES) && s3Store.get('/test-bucket/' + d0.storageKey).body.equals(PDF_BYTES));
+  check('...invalid photos left untouched', (await itemNow(2)).imageUrl === 'https://example.com/tracker.jpg' && (await itemNow(2)).imageKey === null && (await itemNow(3)).imageKey === null);
+  const storeAfter = s3Store.size;
+  r = await runScript('--apply');
+  check('--apply again: nothing to move, nothing uploaded', r.code === 0 && (r.out.match(/moved: 0 \(/g) || []).length === 2 && s3Store.size === storeAfter, r.out);
+  const shown = (await call('GET', '/catalog', B1)).data.find((i) => i.id === m0.id);
+  check('moved photo is served from the bucket (presigned link)', new URL(shown.imageUrl).pathname === '/test-bucket/' + m0.imageKey);
+  r = await call('GET', `/admin/companies/sup2/documents/${d0.id}`, ADM);
+  check('moved document is served from the bucket', r.status === 200 && new URL(r.data.url).pathname === '/test-bucket/' + d0.storageKey && !('fileUrl' in r.data));
+  r = await runScript('--verify');
+  check('--verify: exit 0', r.code === 0 && /catalog photos: \d+ verified/.test(r.out) && /verification documents: \d+ verified/.test(r.out) && !/PROBLEM/.test(r.out), r.out);
+
+  // a missing object: verify fails, cleanup keeps that row's data: URL
+  const hidden = s3Store.get('/test-bucket/' + m1.imageKey);
+  s3Store.delete('/test-bucket/' + m1.imageKey);
+  r = await runScript('--verify');
+  check('--verify with a missing file: exit 1, names it', r.code === 1 && r.out.includes(`${m1.id}: missing in the bucket`), r.out);
+  r = await runScript('--cleanup');
+  check('--cleanup dry run: 1 photo + 2 documents can be cleared, 1 not', r.code === 1 && /catalog photos:\s+can be cleared: 1 /.test(r.out) && /verification documents:\s+can be cleared: 2 /.test(r.out) &&
+    /NOT cleared \(file not verified in the bucket\): 1/.test(r.out) && (await itemNow(0)).imageUrl === JPG_URL, r.out);
+  r = await runScript('--cleanup', '--apply');
+  check('--cleanup --apply: clears only verified rows', (await itemNow(0)).imageUrl === null && (await itemNow(1)).imageUrl === PNG_URL && (await docNow(0)).fileUrl === null && (await docNow(1)).fileUrl === null, r.out);
+  s3Store.set('/test-bucket/' + m1.imageKey, hidden);
+  r = await runScript('--cleanup', '--apply');
+  check('...after the file is back: cleared too, exit 0', r.code === 0 && (await itemNow(1)).imageUrl === null, r.out);
+  check('...documents open from the bucket after cleanup', (await call('GET', `/admin/companies/sup2/documents/${d1.id}`, ADM)).data.url.includes(d1.storageKey));
+
+  r = await runScript('--clear-invalid-images');
+  check('--clear-invalid-images dry run: lists 2, clears nothing', r.code === 0 && /aren't a valid image: 2 \(dry run/.test(r.out) && (await itemNow(2)).imageUrl !== null, r.out);
+  r = await runScript('--clear-invalid-images', '--apply');
+  check('--clear-invalid-images --apply: both cleared, valid photos untouched', r.code === 0 && (await itemNow(2)).imageUrl === null && (await itemNow(3)).imageUrl === null && (await itemNow(0)).imageKey === m0.imageKey, r.out);
+  check('unknown option -> exit 2', (await runScript('--aply')).code === 2);
   s3Server.close();
 
   console.log('\n== 18d. L6 change-password attempts limited per user ==');
