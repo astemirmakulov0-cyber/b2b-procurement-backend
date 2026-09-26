@@ -19,8 +19,8 @@ async function isVerified(companyId) {
   const c = await prisma.company.findUnique({ where: { id: companyId }, select: { verificationStatus: true } });
   return !!c && c.verificationStatus === 'VERIFIED';
 }
-// whose items others may see: verified suppliers with an active company and account
-const VISIBLE_SUPPLIER = { isActive: true, verificationStatus: 'VERIFIED', user: { isActive: true } };
+// whose items others may see: verified suppliers with an active, non-suspended company and account
+const VISIBLE_SUPPLIER = { isActive: true, suspendedAt: null, verificationStatus: 'VERIFIED', user: { isActive: true } };
 
 // POST /api/catalog  (supplier)  body: { name, price, description?, unit?, category?, imageUrl?: data: URL }
 // The photo must be a JPEG, PNG or WebP data: URL under 2MB (checked by content); it is stored in the bucket.

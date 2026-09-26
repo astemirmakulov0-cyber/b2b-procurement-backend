@@ -281,4 +281,52 @@ const cancelRFQ = asyncHandler(async (req, res) => {
   res.json(result);
 });
 
-module.exports = { createRFQ, listRFQs, getRFQ, updateRFQ, cancelRFQ };
+const RFQ_STATUSES_ALL = ['DRAFT', 'PUBLISHED', 'QUOTING_CLOSED', 'AWARDED', 'CANCELLED'];
+const MAX_PAGE_SIZE = 100;
+
+// GET /api/admin/rfqs?status=&buyerCompanyId=&dateFrom=&dateTo=&q=&page=&pageSize=  (admin)
+// dateFrom/dateTo filter on createdAt (inclusive); q searches the title (case-insensitive, contains).
+const listRFQsAdmin = asyncHandler(async (req, res) => {
+  const { status, buyerCompanyId, dateFrom, dateTo, q } = req.query;
+  if (status !== undefined && !RFQ_STATUSES_ALL.includes(status)) {
+    return res.status(400).json({ error: 'status must be one of ' + RFQ_STATUSES_ALL.join(', ') });
+  }
+  const page = Math.max(1, parseInt(req.query.page, 10) || 1);
+  const pageSize = Math.min(MAX_PAGE_SIZE, Math.max(1, parseInt(req.query.pageSize, 10) || 20));
+
+  const createdAt = {};
+  if (dateFrom) {
+    const d = new Date(dateFrom);
+    if (Number.isNaN(d.getTime())) return res.status(400).json({ error: 'dateFrom is not a valid date' });
+    createdAt.gte = d;
+  }
+  if (dateTo) {
+    const d = new Date(dateTo);
+    if (Number.isNaN(d.getTime())) return res.status(400).json({ error: 'dateTo is not a valid date' });
+    createdAt.lte = d;
+  }
+
+  const where = {
+    status: status || undefined,
+    buyerCompanyId: buyerCompanyId || undefined,
+    createdAt: (dateFrom || dateTo) ? createdAt : undefined,
+    title: q ? { contains: q, mode: 'insensitive' } : undefined,
+  };
+
+  const [total, rfqs] = await Promise.all([
+    prisma.rFQ.count({ where }),
+    prisma.rFQ.findMany({
+      where,
+      include: {
+        buyerCompany: { select: { id: true, name: true, isActive: true } },
+        _count: { select: { quotes: true } },
+      },
+      orderBy: { createdAt: 'desc' },
+      skip: (page - 1) * pageSize,
+      take: pageSize,
+    }),
+  ]);
+  res.json({ items: rfqs, total, page, pageSize });
+});
+
+module.exports = { createRFQ, listRFQs, getRFQ, updateRFQ, cancelRFQ, listRFQsAdmin };

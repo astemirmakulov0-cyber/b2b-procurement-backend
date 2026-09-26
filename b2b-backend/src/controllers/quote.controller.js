@@ -5,11 +5,24 @@ const { MONEY_DECIMALS, MONEY_MAX, parseAmount, formatAmount } = require('../uti
 const { ATTACHMENT_SELECT } = require('./quoteAttachment.controller');
 
 const BID_FEE_PERCENT = 0.05; // supplier pays 5% of the RFQ's budget to submit a quote
+const DEFAULT_PAYMENT_TERMS_DAYS = 30;
+const MAX_PAYMENT_TERMS_DAYS = 120;
+
+// { value } — an integer 0-120, defaulting to 30 when omitted/null — or { error }
+function parsePaymentTermsDays(raw) {
+  if (raw === undefined || raw === null || raw === '') return { value: DEFAULT_PAYMENT_TERMS_DAYS };
+  const n = Number(raw);
+  if (!Number.isInteger(n) || n < 0 || n > MAX_PAYMENT_TERMS_DAYS) {
+    return { error: `paymentTermsDays must be a whole number between 0 and ${MAX_PAYMENT_TERMS_DAYS}` };
+  }
+  return { value: n };
+}
 
 // POST /api/rfqs/:rfqId/quotes  (supplier, must be verified) - submits a bid, deducts 5% of RFQ budget from wallet
-// body: { unitPrice, deliveryTimeDays } — the price per unit; the quote total (price) = unitPrice × the RFQ quantity.
-// A body with only `price` (pages loaded before unit pricing, where that field was labelled "Unit price") is read as
-// the unit price too.
+// body: { unitPrice, deliveryTimeDays, paymentTermsDays } — the price per unit; the quote total (price) =
+// unitPrice × the RFQ quantity. paymentTermsDays (0-120, default 30) is how long the buyer has to pay the
+// invoice after confirming receipt; it is carried to the LPO and then the invoice. A body with only `price`
+// (pages loaded before unit pricing, where that field was labelled "Unit price") is read as the unit price too.
 const submitQuote = asyncHandler(async (req, res) => {
   const company = await prisma.company.findUnique({ where: { id: req.user.companyId } });
   if (!company || company.verificationStatus !== 'VERIFIED') {
@@ -21,6 +34,8 @@ const submitQuote = asyncHandler(async (req, res) => {
   const parsedUnit = parseAmount(req.body.unitPrice !== undefined ? req.body.unitPrice : req.body.price, 'unitPrice');
   if (parsedUnit.error) return res.status(400).json({ error: parsedUnit.error });
   if (currency !== undefined && currency !== 'BHD') return res.status(400).json({ error: 'Only BHD is supported' });
+  const paymentTerms = parsePaymentTermsDays(req.body.paymentTermsDays);
+  if (paymentTerms.error) return res.status(400).json({ error: paymentTerms.error });
 
   const fail = (status, message) => Object.assign(new Error(message), { status });
 
@@ -71,6 +86,7 @@ const submitQuote = asyncHandler(async (req, res) => {
         unitPrice: parsedUnit.value,
         currency: 'BHD',
         deliveryTimeDays,
+        paymentTermsDays: paymentTerms.value,
         notes,
       },
     });

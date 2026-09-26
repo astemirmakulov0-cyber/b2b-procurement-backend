@@ -3,15 +3,18 @@ const rfqCtrl = require('../controllers/rfq.controller');
 const quoteCtrl = require('../controllers/quote.controller');
 const attachmentCtrl = require('../controllers/quoteAttachment.controller');
 const lpoCtrl = require('../controllers/lpo.controller');
-const { authRequired, requireRole } = require('../middleware/auth');
+const { authRequired, requireRole, requireNotSuspended } = require('../middleware/auth');
 
-router.post('/rfqs', authRequired, requireRole('BUYER'), rfqCtrl.createRFQ);
+router.post('/rfqs', authRequired, requireRole('BUYER'), requireNotSuspended, rfqCtrl.createRFQ);
 router.get('/rfqs', authRequired, rfqCtrl.listRFQs);
 router.get('/rfqs/:id', authRequired, rfqCtrl.getRFQ);
-router.patch('/rfqs/:id', authRequired, requireRole('BUYER'), rfqCtrl.updateRFQ);
+router.patch('/rfqs/:id', authRequired, requireRole('BUYER'), requireNotSuspended, rfqCtrl.updateRFQ);
 router.post('/rfqs/:id/cancel', authRequired, requireRole('BUYER'), rfqCtrl.cancelRFQ);
 
-router.post('/rfqs/:rfqId/quotes', authRequired, requireRole('SUPPLIER'), quoteCtrl.submitQuote);
+// Admin
+router.get('/admin/rfqs', authRequired, requireRole('ADMIN'), rfqCtrl.listRFQsAdmin);
+
+router.post('/rfqs/:rfqId/quotes', authRequired, requireRole('SUPPLIER'), requireNotSuspended, quoteCtrl.submitQuote);
 router.get('/rfqs/:rfqId/quotes', authRequired, quoteCtrl.listQuotesForRFQ);
 
 router.patch('/quotes/:id/shortlist', authRequired, requireRole('BUYER'), quoteCtrl.shortlistQuote);

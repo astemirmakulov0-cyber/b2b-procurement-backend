@@ -51,6 +51,7 @@ const awardQuote = asyncHandler(async (req, res) => {
         buyerCompanyId: quote.rfq.buyerCompanyId,
         supplierCompanyId: quote.supplierCompanyId,
         totalAmount: quote.price,
+        paymentTermsDays: quote.paymentTermsDays,
         terms,
       },
     });
@@ -79,7 +80,8 @@ const acceptLPO = asyncHandler(async (req, res) => {
       data: { lpoId: lpo.id, status: 'CONFIRMED' },
     });
     await tx.delivery.create({ data: { orderId: order.id } });
-    await tx.invoice.create({ data: { orderId: order.id, amount: lpo.totalAmount } });
+    // dueDate is set only once the buyer confirms receipt (see confirmReceipt), not here
+    await tx.invoice.create({ data: { orderId: order.id, amount: lpo.totalAmount, paymentTermsDays: lpo.paymentTermsDays } });
     // the winning bid's attachments become order documents (same stored objects; the quote is frozen by now)
     const attachments = await tx.quoteAttachment.findMany({ where: { quoteId: lpo.quoteId, deletedAt: null }, orderBy: { createdAt: 'asc' } });
     if (attachments.length) {

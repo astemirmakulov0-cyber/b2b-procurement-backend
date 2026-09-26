@@ -14,6 +14,9 @@ process.env.JWT_SECRET = 'itest-secret-0123456789-abcdefghij-long-enough';
 process.env.PORT = process.env.TEST_APP_PORT;
 process.env.RESEND_API_KEY = 're_test_dummy';
 process.env.SENTRY_DSN = '';
+// disables the app's own hourly overdue-invoice check: tests call checkOverdueInvoices() directly instead,
+// to avoid a background interval racing the assertions below
+process.env.NODE_ENV = 'test';
 
 // Stub Sentry so no test event is ever sent; captured errors/messages are kept for assertions
 const sentryCaptured = [];
@@ -49,6 +52,7 @@ const bcrypt = require('bcryptjs');
 const { PrismaClient } = require('@prisma/client');
 const db = new PrismaClient();
 const BASE = `http://127.0.0.1:${process.env.TEST_APP_PORT}/api`;
+const { checkOverdueInvoices } = require(path.join(root, 'src/utils/overdueCheck'));
 
 let pass = 0, fail = 0;
 const check = (name, cond, extra) => { cond ? pass++ : fail++; console.log((cond ? 'PASS ' : 'FAIL ') + name + (extra !== undefined ? '  ' + JSON.stringify(extra) : '')); };
@@ -609,7 +613,7 @@ async function newRfq(budget = 500, extra = {}) {
   check('supplier GET /orders: buyer name', ordSupRow && ordSupRow.lpo.buyerCompany.name === 'Co buyer1');
   const detail = (await call('GET', `/orders/${mo.id}`, S2)).data;
   check('GET /orders/:id includes both company names', detail.lpo.buyerCompany.name === 'Co buyer1' && detail.lpo.supplierCompany.name === 'Co sup2');
-  check('company objects expose only id, name, isActive', Object.keys(ordBuyerRow.lpo.supplierCompany).sort().join() === 'id,isActive,name');
+  check('company objects expose only id, name, isActive, suspendedAt', Object.keys(ordBuyerRow.lpo.supplierCompany).sort().join() === 'id,isActive,name,suspendedAt');
   check('other supplier cannot read the order -> 403', (await call('GET', `/orders/${mo.id}`, S1)).status === 403);
 
   console.log('\n== 16. M16 notify() failures are reported ==');
@@ -868,9 +872,9 @@ async function newRfq(budget = 500, extra = {}) {
 
   // admin list and chat access
   r = await call('GET', '/admin/orders?status=DISPUTED', ADM);
-  const listed = r.status === 200 && r.data.find((x) => x.id === dd.order.id);
+  const listed = r.status === 200 && r.data.items.find((x) => x.id === dd.order.id);
   check('admin lists disputed orders with reason and both parties', !!listed && listed.disputeReason === 'Goods damaged on arrival' &&
-    listed.lpo.buyerCompany.name === 'Co buyer1' && listed.lpo.supplierCompany.name === 'Co sup2' && r.data.every((x) => x.status === 'DISPUTED'), listed);
+    listed.lpo.buyerCompany.name === 'Co buyer1' && listed.lpo.supplierCompany.name === 'Co sup2' && r.data.items.every((x) => x.status === 'DISPUTED'), listed);
   check('admin list: invalid status -> 400', (await call('GET', '/admin/orders?status=FOO', ADM)).status === 400);
   check('admin list: buyer / supplier -> 403', (await call('GET', '/admin/orders', B1)).status === 403 && (await call('GET', '/admin/orders', S2)).status === 403);
   r = await call('GET', `/orders/${dd.order.id}/messages`, ADM);
@@ -906,7 +910,7 @@ async function newRfq(budget = 500, extra = {}) {
   check('dispute without reason -> 200', (await dispute(dd.order.id, {})).status === 200);
   check('...no chat message written', (await db.message.count({ where: { orderId: dd.order.id } })) === 0);
   r = await call('GET', '/admin/orders?status=DISPUTED', ADM);
-  check('...admin list shows reason null', r.data.find((x) => x.id === dd.order.id).disputeReason === null);
+  check('...admin list shows reason null', r.data.items.find((x) => x.id === dd.order.id).disputeReason === null);
   // a pre-rule payment fully paying the invoice during the dispute: order stays DISPUTED; RESUME goes back
   // to the pre-dispute status (not COMPLETED — the goods aren't received); receipt then completes it
   const inv = await db.invoice.findUnique({ where: { orderId: dd.order.id } });
@@ -1997,6 +2001,243 @@ async function newRfq(budget = 500, extra = {}) {
     (await db.notification.count({ where: { relatedOrderId: cancelOrder.id, type: 'ORDER_STATUS' } })) === 1 &&
     (await db.notification.count({ where: { relatedOrderId: cancelOrder.id, type: 'DISPUTE_OPENED' } })) === 0);
   check('buyer gets an email for the plain cancellation', !!sentEmails.find((m) => m.to === 'buyer1@t.test' && /Order cancelled/.test(m.subject)));
+
+  console.log('\n== 12. Admin: All RFQs / All orders / Analytics (stage A) ==');
+  {
+    check('GET /admin/rfqs forbidden for a buyer', (await call('GET', '/admin/rfqs', B1)).status === 403);
+    const rAll = await call('GET', '/admin/rfqs', ADM);
+    check('GET /admin/rfqs -> 200 with items/total/page/pageSize', rAll.status === 200 &&
+      Array.isArray(rAll.data.items) && typeof rAll.data.total === 'number' && rAll.data.page === 1 && rAll.data.pageSize === 20, rAll.data);
+    check('GET /admin/rfqs bad status -> 400', (await call('GET', '/admin/rfqs?status=NOPE', ADM)).status === 400);
+
+    const uniqueTitle = 'Stage A search target ' + Date.now();
+    await newRfq(300, { title: uniqueTitle });
+    const rSearch = await call('GET', '/admin/rfqs?q=' + encodeURIComponent('search target'), ADM);
+    check('GET /admin/rfqs?q= finds the RFQ by a case-insensitive title fragment',
+      rSearch.status === 200 && rSearch.data.items.some((r) => r.title === uniqueTitle), rSearch.data);
+
+    const rByBuyer = await call('GET', '/admin/rfqs?buyerCompanyId=buyer2', ADM);
+    check('GET /admin/rfqs?buyerCompanyId= only returns that buyer\'s RFQs',
+      rByBuyer.status === 200 && rByBuyer.data.items.every((r) => r.buyerCompany.id === 'buyer2'), rByBuyer.data);
+
+    const rPaged = await call('GET', '/admin/rfqs?pageSize=1&page=1', ADM);
+    check('GET /admin/rfqs?pageSize=1 returns exactly one item', rPaged.status === 200 && rPaged.data.items.length === 1, rPaged.data);
+
+    check('GET /admin/orders forbidden for a supplier', (await call('GET', '/admin/orders', S1)).status === 403);
+    const { order: analyticsOrder } = await makeOrder(60, S2, 'sup2', B2, { received: true });
+    const rOrders = await call('GET', '/admin/orders', ADM);
+    check('GET /admin/orders -> 200 with items/total/page/pageSize (new paginated shape)', rOrders.status === 200 &&
+      Array.isArray(rOrders.data.items) && typeof rOrders.data.total === 'number', rOrders.data);
+    check('GET /admin/orders includes an order just created', rOrders.data.items.some((o) => o.id === analyticsOrder.id));
+
+    const rBySupplier = await call('GET', '/admin/orders?supplierCompanyId=sup2&pageSize=100', ADM);
+    check('GET /admin/orders?supplierCompanyId= filters to that supplier only',
+      rBySupplier.status === 200 && rBySupplier.data.items.every((o) => o.lpo.supplierCompany.id === 'sup2'), rBySupplier.data.items.map((o) => o.lpo.supplierCompany.id));
+
+    check('GET /admin/analytics forbidden for a buyer', (await call('GET', '/admin/analytics', B1)).status === 403);
+    const rAn = await call('GET', '/admin/analytics', ADM);
+    check('GET /admin/analytics -> 200 with companiesByStatus and 7d/30d/all windows', rAn.status === 200 &&
+      rAn.data.companiesByStatus && typeof rAn.data.companiesByStatus.VERIFIED === 'number' &&
+      rAn.data.windows && rAn.data.windows['7d'] && rAn.data.windows['30d'] && rAn.data.windows.all, rAn.data);
+    check('GET /admin/analytics: verified-company count matches the seed', rAn.data.companiesByStatus.VERIFIED >= 5, rAn.data.companiesByStatus);
+    check('GET /admin/analytics: all-time LPOs issued counts at least the LPOs created in this run',
+      rAn.data.windows.all.lposIssued >= 1, rAn.data.windows.all);
+    check('GET /admin/analytics: bid-fee revenue and completed-orders amount are numeric strings',
+      /^\d+\.\d{3}$/.test(rAn.data.windows.all.bidFeeRevenue) && /^\d+\.\d{3}$/.test(rAn.data.windows.all.completedOrdersAmount), rAn.data.windows.all);
+  }
+
+  console.log('\n== 13. Admin: reversible company suspension (stage B) ==');
+  {
+    check('deactivate: missing reason -> 400', (await call('POST', '/admin/companies/sup3/deactivate', ADM, {})).status === 400);
+    check('deactivate: forbidden for non-admin', (await call('POST', '/admin/companies/sup3/deactivate', S1, { reason: 'x' })).status === 403);
+
+    // a catalog item exists before suspension, and stays visible to its own company but hidden from others
+    const item = (await call('POST', '/catalog', S3, { name: 'Sup3 widget', price: 10 })).data;
+    check('sup3 catalog item created', !!item.id, item);
+    check('buyer sees the item before suspension', (await call('GET', '/catalog', B1)).data.some((i) => i.id === item.id));
+
+    // an order already in flight, started before suspension: it must stay unaffected by it
+    const { order: susOrder } = await makeOrder(30, S3, 'sup3', B1, { received: true });
+
+    r = await call('POST', '/admin/companies/sup3/deactivate', ADM, { reason: 'Repeated late deliveries under review' });
+    check('deactivate -> 200', r.status === 200, r.data);
+    const sup3 = await db.company.findUnique({ where: { id: 'sup3' } });
+    check('suspendedAt/suspensionReason set, isActive untouched', !!sup3.suspendedAt && sup3.suspensionReason === 'Repeated late deliveries under review' && sup3.isActive === true, sup3);
+    check('deactivate: already suspended -> 400', (await call('POST', '/admin/companies/sup3/deactivate', ADM, { reason: 'again' })).status === 400);
+
+    await settle();
+    const suspendNote = await notesOf('sup3', 'ACCOUNT_SUSPENDED');
+    check('company gets an ACCOUNT_SUSPENDED notification with the reason', suspendNote.some((n) => n.body.includes('Repeated late deliveries')));
+    check('company gets a suspension email', !!sentEmails.find((m) => m.to === 'sup3@t.test' && /suspended/.test(m.subject)));
+
+    check('a suspended company can still sign in / use the API', (await call('GET', '/companies/me', S3)).status === 200);
+    r = await call('GET', '/companies/me', S3);
+    check('GET /companies/me reflects the suspension', !!r.data.suspendedAt, r.data);
+
+    check('suspended supplier cannot submit a quote', (await call('POST', `/rfqs/${(await newRfq(200)).id}/quotes`, S3, { price: 90 })).status === 403);
+    r = await call('POST', `/rfqs/${(await newRfq(200)).id}/quotes`, S3, { price: 90 });
+    check('...error names the reason', r.status === 403 && r.data.error.includes('Repeated late deliveries'), r.data);
+    check('suspended supplier cannot create a catalog item', (await call('POST', '/catalog', S3, { name: 'x', price: 1 })).status === 403);
+    check('suspended supplier cannot edit its catalog item', (await call('PATCH', `/catalog/${item.id}`, S3, { price: 20 })).status === 403);
+    check('suspended supplier cannot delete its catalog item', (await call('DELETE', `/catalog/${item.id}`, S3)).status === 403);
+
+    check('the suspended supplier\'s catalog is now hidden from other companies', !(await call('GET', '/catalog', B1)).data.some((i) => i.id === item.id));
+    check('...but the supplier still sees its own catalog', (await call('GET', '/catalog', S3)).data.some((i) => i.id === item.id));
+
+    // the order already in flight (created before suspension) is unaffected: delivery, payments, messages still work
+    check('supplier can still update delivery on an order in flight', (await call('PATCH', `/orders/${susOrder.id}/delivery`, S3, { notes: 'still shipping fine' })).status === 200);
+    check('buyer can still pay the invoice', (await call('POST', `/invoices/${(await db.invoice.findUnique({ where: { orderId: susOrder.id } })).id}/payments`, B1, { amount: 1, method: 'cash' })).status === 201);
+    check('supplier can still post a chat message on the order', (await call('POST', `/orders/${susOrder.id}/messages`, S3, { body: 'hello' })).status === 201);
+
+    r = await call('POST', '/admin/companies/sup3/reactivate', ADM);
+    check('reactivate -> 200', r.status === 200, r.data);
+    check('suspendedAt/suspensionReason cleared', (await db.company.findUnique({ where: { id: 'sup3' } })).suspendedAt === null);
+    check('reactivate: not suspended -> 400', (await call('POST', '/admin/companies/sup3/reactivate', ADM)).status === 400);
+    await settle();
+    check('company gets an ACCOUNT_REACTIVATED notification', (await notesOf('sup3', 'ACCOUNT_REACTIVATED')).length >= 1);
+    check('company gets a reactivation email', !!sentEmails.find((m) => m.to === 'sup3@t.test' && /reactivated/.test(m.subject)));
+    check('supplier can submit quotes again after reactivation', (await call('POST', `/rfqs/${(await newRfq(200)).id}/quotes`, S3, { price: 90 })).status === 201);
+
+    // deactivating a buyer closes its open RFQs (refund + notify the supplier) and withdraws its pending quotes
+    await db.wallet.update({ where: { companyId: 'sup1' }, data: { balance: 1000 } });
+    const b2Rfq = await call('POST', '/rfqs', B2, { title: 'Buyer2 open RFQ', description: 'd', category: 'Restaurants & Cafés', quantity: 1, budget: 150, deadline: future(), publish: true });
+    const quoteOnB2 = await call('POST', `/rfqs/${b2Rfq.data.id}/quotes`, S1, { price: 60 });
+    check('sup1 quotes on buyer2\'s RFQ -> 201', quoteOnB2.status === 201, quoteOnB2.data);
+    const balBefore = await bal('sup1');
+    r = await call('POST', '/admin/companies/buyer2/deactivate', ADM, { reason: 'Fraud investigation' });
+    check('deactivate buyer2 -> 200', r.status === 200, r.data);
+    const closedRfq = await db.rFQ.findUnique({ where: { id: b2Rfq.data.id } });
+    check('buyer2\'s open RFQ is cancelled', closedRfq.status === 'CANCELLED', closedRfq);
+    check('the bid fee is refunded to the supplier', await bal('sup1') > balBefore, { before: balBefore, after: await bal('sup1') });
+    await settle();
+    check('supplier is notified its quote/RFQ was cancelled', (await notesOf('sup1', 'RFQ_CANCELLED')).length >= 1);
+
+    // deactivating a supplier withdraws its pending quotes and notifies the buyer, without a refund
+    await db.wallet.update({ where: { companyId: 'sup2' }, data: { balance: 1000 } });
+    const rfqForSup2 = await newRfq(120);
+    const sup2Quote = await call('POST', `/rfqs/${rfqForSup2.id}/quotes`, S2, { price: 50 });
+    check('sup2 quotes -> 201', sup2Quote.status === 201, sup2Quote.data);
+    r = await call('POST', '/admin/companies/sup2/deactivate', ADM, { reason: 'Compliance review' });
+    check('deactivate sup2 -> 200', r.status === 200, r.data);
+    const withdrawnQuote = await db.quote.findUnique({ where: { id: sup2Quote.data.id } });
+    check('sup2\'s pending quote is withdrawn', withdrawnQuote.status === 'WITHDRAWN', withdrawnQuote);
+    await settle();
+    check('the RFQ\'s buyer is notified the quote was withdrawn', (await notesOf('buyer1', 'QUOTE_WITHDRAWN')).length >= 1);
+    await call('POST', '/admin/companies/sup2/reactivate', ADM); // leave sup2 usable for anything after this
+  }
+
+  console.log('\n== 14. Delivery status flow: shipped/delivered/failed (stage C) ==');
+  {
+    await db.wallet.update({ where: { companyId: 'sup2' }, data: { balance: 1000 } });
+    const del = async (orderId) => (await db.delivery.findUnique({ where: { orderId } })).status;
+    const ordSt = async (orderId) => (await db.order.findUnique({ where: { id: orderId } })).status;
+
+    // fresh flow: PENDING -> IN_TRANSIT ("Mark as shipped") -> DELIVERED ("Mark as delivered")
+    const { order: o1 } = await makeOrder(20, S2, 'sup2');
+    check('delivery PENDING -> IN_TRANSIT -> 200, order SHIPPED',
+      (await call('PATCH', `/orders/${o1.id}/delivery`, S2, { status: 'IN_TRANSIT' })).status === 200 && await del(o1.id) === 'IN_TRANSIT' && await ordSt(o1.id) === 'SHIPPED');
+    check('dispatchedAt is set even skipping DISPATCHED', !!(await db.delivery.findUnique({ where: { orderId: o1.id } })).dispatchedAt);
+    sentEmails.length = 0;
+    r = await call('PATCH', `/orders/${o1.id}/delivery`, S2, { status: 'DELIVERED' });
+    check('delivery IN_TRANSIT -> DELIVERED -> 200, order DELIVERED', r.status === 200 && await del(o1.id) === 'DELIVERED' && await ordSt(o1.id) === 'DELIVERED');
+    await settle();
+    check('buyer gets a "shipped/delivered" email', sentEmails.some((m) => m.to === 'buyer1@t.test' && /delivered/.test(m.subject)));
+
+    // legacy DISPATCHED status still has both IN_TRANSIT and DELIVERED as valid next steps
+    const { order: o2 } = await makeOrder(20, S2, 'sup2');
+    await call('PATCH', `/orders/${o2.id}/delivery`, S2, { status: 'DISPATCHED' });
+    check('DISPATCHED -> IN_TRANSIT is allowed', (await call('PATCH', `/orders/${o2.id}/delivery`, S2, { status: 'IN_TRANSIT' })).status === 200);
+    const { order: o3 } = await makeOrder(20, S2, 'sup2');
+    await call('PATCH', `/orders/${o3.id}/delivery`, S2, { status: 'DISPATCHED' });
+    check('DISPATCHED -> DELIVERED is also allowed directly', (await call('PATCH', `/orders/${o3.id}/delivery`, S2, { status: 'DELIVERED' })).status === 200 && await del(o3.id) === 'DELIVERED');
+
+    // delivery failed: reason required, notifies + emails the buyer, and can be retried (-> IN_TRANSIT)
+    const { order: o4 } = await makeOrder(20, S2, 'sup2');
+    await call('PATCH', `/orders/${o4.id}/delivery`, S2, { status: 'IN_TRANSIT' });
+    check('FAILED without a reason -> 400', (await call('PATCH', `/orders/${o4.id}/delivery`, S2, { status: 'FAILED' })).status === 400);
+    sentEmails.length = 0;
+    r = await call('PATCH', `/orders/${o4.id}/delivery`, S2, { status: 'FAILED', reason: 'Recipient not available' });
+    check('FAILED with a reason -> 200, delivery FAILED, order stays SHIPPED', r.status === 200 && await del(o4.id) === 'FAILED' && await ordSt(o4.id) === 'SHIPPED', r.data);
+    check('the reason is kept on the delivery', (await db.delivery.findUnique({ where: { orderId: o4.id } })).notes === 'Recipient not available');
+    await settle();
+    check('buyer gets a DELIVERY notification for the failure', (await notesOf('buyer1', 'DELIVERY', o4.id)).some((n) => n.title === 'Delivery failed'));
+    check('buyer gets a delivery-failed email with the reason', sentEmails.some((m) => m.to === 'buyer1@t.test' && m.subject === 'Delivery failed'));
+    check('FAILED -> DISPATCHED -> 400 (retries go through IN_TRANSIT, not DISPATCHED)', (await call('PATCH', `/orders/${o4.id}/delivery`, S2, { status: 'DISPATCHED' })).status === 400);
+    check('FAILED -> IN_TRANSIT (send again) -> 200', (await call('PATCH', `/orders/${o4.id}/delivery`, S2, { status: 'IN_TRANSIT' })).status === 200 && await del(o4.id) === 'IN_TRANSIT');
+    check('delivery can then complete normally', (await call('PATCH', `/orders/${o4.id}/delivery`, S2, { status: 'DELIVERED' })).status === 200 && await del(o4.id) === 'DELIVERED');
+
+    check('reason over 1000 chars -> 400', (await (async () => {
+      const { order: o5 } = await makeOrder(20, S2, 'sup2');
+      await call('PATCH', `/orders/${o5.id}/delivery`, S2, { status: 'IN_TRANSIT' });
+      return call('PATCH', `/orders/${o5.id}/delivery`, S2, { status: 'FAILED', reason: 'x'.repeat(1001) });
+    })()).status === 400);
+  }
+
+  console.log('\n== 15. Payment terms and overdue invoices (stage D) ==');
+  {
+    await db.wallet.update({ where: { companyId: 'sup1' }, data: { balance: 1000 } });
+
+    // validation: 0-120, whole number, default 30
+    const rfqA = await newRfq(100);
+    check('paymentTermsDays -1 -> 400', (await call('POST', `/rfqs/${rfqA.id}/quotes`, S1, { price: 50, paymentTermsDays: -1 })).status === 400);
+    const rfqB = await newRfq(100);
+    check('paymentTermsDays 121 -> 400', (await call('POST', `/rfqs/${rfqB.id}/quotes`, S1, { price: 50, paymentTermsDays: 121 })).status === 400);
+    const rfqC = await newRfq(100);
+    check('paymentTermsDays 30.5 -> 400', (await call('POST', `/rfqs/${rfqC.id}/quotes`, S1, { price: 50, paymentTermsDays: 30.5 })).status === 400);
+    const rfqD = await newRfq(100);
+    r = await call('POST', `/rfqs/${rfqD.id}/quotes`, S1, { price: 50 });
+    check('paymentTermsDays omitted -> defaults to 30', r.status === 201 && r.data.paymentTermsDays === 30, r.data);
+    const rfqE = await newRfq(100);
+    r = await call('POST', `/rfqs/${rfqE.id}/quotes`, S1, { price: 50, paymentTermsDays: 0 });
+    check('paymentTermsDays 0 -> accepted (immediate terms)', r.status === 201 && r.data.paymentTermsDays === 0, r.data);
+
+    // full flow: quote's terms carry to the LPO and the invoice; dueDate stays null until receipt is confirmed
+    const rfqF = await newRfq(100);
+    const q45 = await call('POST', `/rfqs/${rfqF.id}/quotes`, S1, { price: 40, paymentTermsDays: 45 });
+    check('quote paymentTermsDays=45 -> 201', q45.status === 201 && q45.data.paymentTermsDays === 45, q45.data);
+    const award45 = await call('POST', `/quotes/${q45.data.id}/award`, B1, {});
+    const lpo45 = await db.lPO.findUnique({ where: { id: award45.data.id } });
+    check('LPO copies paymentTermsDays from the quote', lpo45.paymentTermsDays === 45, lpo45);
+    const acc45 = await call('PATCH', `/lpos/${lpo45.id}/accept`, S1, {});
+    let inv45 = await db.invoice.findUnique({ where: { orderId: acc45.data.order.id } });
+    check('Invoice copies paymentTermsDays from the LPO, dueDate still null (not received yet)',
+      inv45.paymentTermsDays === 45 && inv45.dueDate === null, inv45);
+
+    await call('PATCH', `/orders/${acc45.data.order.id}/delivery`, S1, { status: 'IN_TRANSIT' });
+    const beforeReceipt = Date.now();
+    r = await call('POST', `/orders/${acc45.data.order.id}/receipt`, B1, {});
+    check('buyer confirms receipt -> 200', r.status === 200, r.data);
+    inv45 = await db.invoice.findUnique({ where: { orderId: acc45.data.order.id } });
+    const expectedDue = beforeReceipt + 45 * 86400000;
+    check('dueDate is now set to receipt date + 45 days', inv45.dueDate && Math.abs(inv45.dueDate.getTime() - expectedDue) < 10000,
+      { dueDate: inv45.dueDate, expectedDue: new Date(expectedDue) });
+    check('invoice is not overdue yet (due 45 days out)', inv45.status === 'ISSUED');
+
+    // overdue check: idempotent, notifies + emails both parties once, never touches an invoice with no dueDate
+    await db.invoice.update({ where: { id: inv45.id }, data: { dueDate: new Date(Date.now() - 86400000) } }); // due yesterday
+    sentEmails.length = 0;
+    await checkOverdueInvoices();
+    inv45 = await db.invoice.findUnique({ where: { id: inv45.id } });
+    check('overdue invoice flips to OVERDUE', inv45.status === 'OVERDUE', inv45);
+    await settle();
+    check('buyer gets an INVOICE_OVERDUE notification', (await notesOf('buyer1', 'INVOICE_OVERDUE')).length >= 1);
+    check('supplier gets an INVOICE_OVERDUE notification', (await notesOf('sup1', 'INVOICE_OVERDUE')).length >= 1);
+    check('buyer gets an overdue email', !!sentEmails.find((m) => m.to === 'buyer1@t.test' && m.subject === 'Invoice overdue'));
+    check('supplier gets an overdue email', !!sentEmails.find((m) => m.to === 'sup1@t.test' && m.subject === 'Invoice overdue'));
+
+    const buyerNotesBefore = (await notesOf('buyer1', 'INVOICE_OVERDUE')).length;
+    sentEmails.length = 0;
+    await checkOverdueInvoices(); // running again must not re-notify (already OVERDUE)
+    await settle();
+    check('running the check again does not double-notify', (await notesOf('buyer1', 'INVOICE_OVERDUE')).length === buyerNotesBefore && sentEmails.length === 0);
+
+    // an invoice that never had receipt confirmed (dueDate null) can never become overdue
+    const { order: noReceiptOrder, invoice: noReceiptInvoice } = await makeOrder(20, S2, 'sup2');
+    check('invoice with no dueDate stays as-is before the check', noReceiptInvoice.dueDate === null && noReceiptInvoice.status === 'ISSUED');
+    await checkOverdueInvoices();
+    const stillIssued = await db.invoice.findUnique({ where: { id: noReceiptInvoice.id } });
+    check('...and stays ISSUED after the check runs', stillIssued.status === 'ISSUED', stillIssued);
+  }
 
   console.log(`\n${pass} passed, ${fail} failed`);
   await db.$disconnect();

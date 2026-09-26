@@ -7,7 +7,7 @@ async function loadOrderWithAccessCheck(orderId, user) {
     where: { id: orderId },
     include: {
       lpo: { include: {
-        buyerCompany: { select: { id: true, name: true, isActive: true } }, supplierCompany: { select: { id: true, name: true, isActive: true } }, rfq: { select: { title: true } },
+        buyerCompany: { select: { id: true, name: true, isActive: true, suspendedAt: true } }, supplierCompany: { select: { id: true, name: true, isActive: true, suspendedAt: true } }, rfq: { select: { title: true } },
       } },
       delivery: true, invoice: { include: { payments: true } },
     },
@@ -32,7 +32,7 @@ const listOrders = asyncHandler(async (req, res) => {
     include: {
       lpo: { select: {
         id: true, totalAmount: true, rfq: { select: { title: true } },
-        buyerCompany: { select: { id: true, name: true, isActive: true } }, supplierCompany: { select: { id: true, name: true, isActive: true } },
+        buyerCompany: { select: { id: true, name: true, isActive: true, suspendedAt: true } }, supplierCompany: { select: { id: true, name: true, isActive: true, suspendedAt: true } },
       } },
       delivery: true, invoice: true,
     },
@@ -136,33 +136,67 @@ const updateOrderStatus = asyncHandler(async (req, res) => {
   }
 });
 
-// GET /api/admin/orders?status=DISPUTED  (admin) - orders with both parties and, for disputes, the buyer's reason
+const MAX_PAGE_SIZE = 100;
+
+// GET /api/admin/orders?status=&buyerCompanyId=&supplierCompanyId=&dateFrom=&dateTo=&page=&pageSize=  (admin)
+// orders with both parties and, for disputes, the buyer's reason. status filter kept for the disputes tab;
+// the other filters and pagination are for the "All orders" list. dateFrom/dateTo filter on createdAt.
 const listOrdersAdmin = asyncHandler(async (req, res) => {
-  const { status } = req.query;
+  const { status, buyerCompanyId, supplierCompanyId, dateFrom, dateTo } = req.query;
   if (status !== undefined && !ORDER_STATUSES.includes(status)) {
     return res.status(400).json({ error: 'status must be one of ' + ORDER_STATUSES.join(', ') });
   }
-  const orders = await prisma.order.findMany({
-    where: status ? { status } : {},
-    include: {
-      lpo: { select: {
-        id: true, totalAmount: true, buyerCompanyId: true, rfq: { select: { title: true } },
-        buyerCompany: { select: { id: true, name: true, isActive: true } }, supplierCompany: { select: { id: true, name: true, isActive: true } },
-      } },
-      delivery: true, invoice: true,
-    },
-    orderBy: { updatedAt: 'desc' },
-  });
+  const page = Math.max(1, parseInt(req.query.page, 10) || 1);
+  const pageSize = Math.min(MAX_PAGE_SIZE, Math.max(1, parseInt(req.query.pageSize, 10) || 20));
+
+  const createdAt = {};
+  if (dateFrom) {
+    const d = new Date(dateFrom);
+    if (Number.isNaN(d.getTime())) return res.status(400).json({ error: 'dateFrom is not a valid date' });
+    createdAt.gte = d;
+  }
+  if (dateTo) {
+    const d = new Date(dateTo);
+    if (Number.isNaN(d.getTime())) return res.status(400).json({ error: 'dateTo is not a valid date' });
+    createdAt.lte = d;
+  }
+
+  const where = {
+    status: status || undefined,
+    createdAt: (dateFrom || dateTo) ? createdAt : undefined,
+    lpo: (buyerCompanyId || supplierCompanyId) ? {
+      buyerCompanyId: buyerCompanyId || undefined,
+      supplierCompanyId: supplierCompanyId || undefined,
+    } : undefined,
+  };
+
+  const [total, orders] = await Promise.all([
+    prisma.order.count({ where }),
+    prisma.order.findMany({
+      where,
+      include: {
+        lpo: { select: {
+          id: true, totalAmount: true, buyerCompanyId: true, rfq: { select: { title: true } },
+          buyerCompany: { select: { id: true, name: true, isActive: true, suspendedAt: true } }, supplierCompany: { select: { id: true, name: true, isActive: true, suspendedAt: true } },
+        } },
+        delivery: true, invoice: true,
+      },
+      orderBy: { updatedAt: 'desc' },
+      skip: (page - 1) * pageSize,
+      take: pageSize,
+    }),
+  ]);
   // the reason is the latest dispute message written by the buyer (null if the buyer gave none)
   const reasons = orders.length === 0 ? [] : await prisma.message.findMany({
     where: { orderId: { in: orders.map((o) => o.id) }, body: { startsWith: DISPUTE_PREFIX } },
     select: { orderId: true, senderCompanyId: true, body: true },
     orderBy: { createdAt: 'desc' },
   });
-  res.json(orders.map((o) => {
+  const items = orders.map((o) => {
     const m = o.status === 'DISPUTED' && reasons.find((r) => r.orderId === o.id && r.senderCompanyId === o.lpo.buyerCompanyId);
     return { ...o, disputeReason: m ? m.body.slice(DISPUTE_PREFIX.length) : null };
-  }));
+  });
+  res.json({ items, total, page, pageSize });
 });
 
 // Where a resumed order goes when statusBeforeDispute is unknown (disputes opened before it was stored):
@@ -211,19 +245,33 @@ const resolveDispute = asyncHandler(async (req, res) => {
   }
 });
 
+// PENDING/DISPATCHED -> IN_TRANSIT is "Mark as shipped"; IN_TRANSIT -> DELIVERED is "Mark as delivered".
+// DISPATCHED is kept reachable from PENDING (and can still go to IN_TRANSIT or DELIVERED) so an order
+// already sitting in DISPATCHED from before this flow can still move forward normally.
+// FAILED ("Delivery failed") requires a reason (see MAX_COMMENT below); from FAILED the only way forward
+// is sending again, which goes back to IN_TRANSIT.
 const DELIVERY_TRANSITIONS = {
-  PENDING: ['DISPATCHED'],
+  PENDING: ['IN_TRANSIT', 'DISPATCHED'],
   DISPATCHED: ['IN_TRANSIT', 'DELIVERED', 'FAILED'],
   IN_TRANSIT: ['DELIVERED', 'FAILED'],
-  FAILED: ['DISPATCHED'],
+  FAILED: ['IN_TRANSIT'],
   DELIVERED: [],
 };
 
 // PATCH /api/orders/:id/delivery  (supplier) - update delivery status and/or tracking/notes
+// body: { status?, trackingInfo?, notes?, reason? } — reason is required when status is FAILED (kept in notes).
 const updateDelivery = asyncHandler(async (req, res) => {
-  const { status, trackingInfo, notes } = req.body;
+  const { status, trackingInfo } = req.body;
+  let { notes } = req.body;
   if (status !== undefined && !Object.keys(DELIVERY_TRANSITIONS).includes(status)) {
     return res.status(400).json({ error: 'status must be one of ' + Object.keys(DELIVERY_TRANSITIONS).join(', ') });
+  }
+  let reason = '';
+  if (status === 'FAILED') {
+    reason = typeof req.body.reason === 'string' ? req.body.reason.trim() : '';
+    if (!reason) return res.status(400).json({ error: 'reason is required to mark a delivery as failed' });
+    if (reason.length > MAX_COMMENT) return res.status(400).json({ error: `reason must be at most ${MAX_COMMENT} characters` });
+    notes = reason;
   }
   const { order, isSupplier, error } = await loadOrderWithAccessCheck(req.params.id, req.user);
   if (error) return res.status(error.status).json({ error: error.message });
@@ -241,6 +289,7 @@ const updateDelivery = asyncHandler(async (req, res) => {
   if (status !== undefined && status !== current) {
     data.status = status;
     if (status === 'DISPATCHED') data.dispatchedAt = new Date();
+    if (status === 'IN_TRANSIT' && !order.delivery.dispatchedAt) data.dispatchedAt = new Date();
     if (status === 'DELIVERED') data.deliveredAt = new Date();
   }
 
@@ -258,8 +307,13 @@ const updateDelivery = asyncHandler(async (req, res) => {
   });
 
   res.json(delivery);
-  const label = status === 'DISPATCHED' ? 'Your order has been dispatched' : status === 'DELIVERED' ? 'Your order has been delivered' : 'Delivery status updated';
-  notify(order.lpo.buyerCompanyId, 'DELIVERY', label, trackingInfo ? 'Tracking: ' + trackingInfo : undefined, order.id);
+  const label = status === 'DISPATCHED' ? 'Your order has been dispatched'
+    : status === 'IN_TRANSIT' ? (current === 'FAILED' ? 'Your order is on its way again' : 'Your order has been shipped')
+    : status === 'DELIVERED' ? 'Your order has been delivered'
+    : status === 'FAILED' ? 'Delivery failed'
+    : 'Delivery status updated';
+  const body = status === 'FAILED' ? 'Reason: ' + reason.slice(0, 300) : trackingInfo ? 'Tracking: ' + trackingInfo : undefined;
+  notify(order.lpo.buyerCompanyId, 'DELIVERY', label, body, order.id);
 });
 
 // Receipt can be confirmed once the goods are on their way or delivered (not while disputed).
@@ -293,7 +347,10 @@ const confirmReceipt = asyncHandler(async (req, res) => {
     }
     const paid = current.invoice && current.invoice.status === 'PAID';
     if (current.invoice && current.invoice.status !== 'CANCELLED') {
-      await tx.invoice.update({ where: { id: current.invoice.id }, data: { issuedAt: now } });
+      // the invoice only becomes due once receipt is confirmed: dueDate = today + paymentTermsDays
+      const terms = current.invoice.paymentTermsDays ?? 30;
+      const dueDate = new Date(now.getTime() + terms * 86400000);
+      await tx.invoice.update({ where: { id: current.invoice.id }, data: { issuedAt: now, dueDate } });
     }
     await tx.order.update({ where: { id: order.id }, data: { receivedAt: now, status: paid ? 'COMPLETED' : 'DELIVERED' } });
     await tx.message.create({ data: { orderId: order.id, senderCompanyId: req.user.companyId, body: RECEIPT_TEXT + (comment ? ' Note: ' + comment : '') } });

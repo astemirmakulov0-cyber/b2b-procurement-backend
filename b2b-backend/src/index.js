@@ -34,6 +34,7 @@ const publicRoutes = require('./routes/public.routes');
 const errorHandler = require('./middleware/errorHandler');
 const prismaErrors = require('./middleware/prismaErrors');
 const rateLimit = require('express-rate-limit');
+const { checkOverdueInvoices } = require('./utils/overdueCheck');
 
 const app = express();
 // Railway rewrites X-Forwarded-For to "<client IP>, <Railway edge IP>" and then connects through
@@ -126,3 +127,13 @@ app.use(errorHandler);
 
 const PORT = process.env.PORT || 4000;
 app.listen(PORT, () => console.log(`B2B backend running on port ${PORT}`));
+
+// Overdue-invoice check: no separate Railway service — this process stays up (npm start), so a plain
+// interval covers it. Runs once at startup (catches anything that became due while the process was down)
+// and hourly after that; the check itself is idempotent (see overdueCheck.js).
+if (process.env.NODE_ENV !== 'test') {
+  checkOverdueInvoices().catch((err) => console.error('checkOverdueInvoices (startup):', err.message));
+  setInterval(() => {
+    checkOverdueInvoices().catch((err) => console.error('checkOverdueInvoices:', err.message));
+  }, 60 * 60 * 1000);
+}

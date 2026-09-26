@@ -141,6 +141,11 @@ model Company {
   // are kept (financial records shared with counterparties still need the legal entity's identity);
   // phone/address/verificationNotes are cleared. isActive is false at the same time.
   deletedAt        DateTime?
+  // set when an admin suspends the company (reversible; not PDPL erasure). isActive stays true — the
+  // company can still log in and work on orders already in flight — but suspendedAt gates posting new
+  // RFQs/quotes and editing the catalog (checked in code), and hides its catalog from other companies.
+  suspendedAt      DateTime?
+  suspensionReason String?
 
 }
 
@@ -226,6 +231,8 @@ model Quote {
   // (migration 1_l2_l3; Prisma schema can't express CHECK constraints)
   currency           String      @default("BHD")
   deliveryTimeDays   Int?
+  // days the buyer has to pay the invoice after confirming receipt (0-120; CHECK in migration); default 30
+  paymentTermsDays   Int?        @default(30)
   notes              String?
   status             QuoteStatus @default(SUBMITTED)
   // set when an award auto-rejects this quote, so it can be restored if the winner declines the LPO
@@ -276,6 +283,8 @@ model LPO {
   supplierCompany    Company   @relation("SupplierLPOs", fields: [supplierCompanyId], references: [id])
   terms              String?
   totalAmount        Decimal   @db.Decimal(12, 3)
+  // copied from the winning quote at award time; carried to the Invoice when the order is created
+  paymentTermsDays   Int?      @default(30)
   status             LPOStatus @default(ISSUED)
   // the supplier's reason when it declines the LPO (up to 500 characters, CHECK in migration 10); shown to the buyer
   declineReason      String?
@@ -327,6 +336,9 @@ model Invoice {
   order       Order         @relation(fields: [orderId], references: [id])
   amount      Decimal       @db.Decimal(12, 3)
   status      InvoiceStatus @default(ISSUED)
+  // copied from the LPO at order creation; dueDate is only set once the buyer confirms receipt
+  // (dueDate = receipt date + paymentTermsDays) — before that the invoice can never become OVERDUE
+  paymentTermsDays Int?     @default(30)
   dueDate     DateTime?
   issuedAt    DateTime      @default(now())
   updatedAt   DateTime      @updatedAt

@@ -108,4 +108,20 @@ async function sendAccountDeletionEmail(email, companyName) {
   if (error) throw new Error('Resend error: ' + error.message);
 }
 
-module.exports = { notify, notifyNewRfq, sendAccountDeletionEmail };
+// Sent right after an admin deactivates/reactivates a company, always (not gated by emailOtherNotifications —
+// the company needs to know regardless of its email preferences).
+async function sendAccountSuspensionEmail(email, companyName, reason) {
+  const title = 'Your Biddex account has been suspended';
+  const body = `The account for "${companyName}" was suspended by a Biddex admin. Reason: ${reason}. You can still sign in to manage orders already in progress, but cannot post new RFQs, submit quotes or edit your catalog until it is reactivated.`;
+  const { error } = await resend.emails.send({ from: FROM, to: email, subject: title, html: emailHtml(title, body) });
+  if (error) throw new Error('Resend error: ' + error.message);
+}
+
+async function sendAccountReactivationEmail(email, companyName) {
+  const title = 'Your Biddex account has been reactivated';
+  const body = `The account for "${companyName}" has been reactivated. You can now post RFQs, submit quotes and edit your catalog again.`;
+  const { error } = await resend.emails.send({ from: FROM, to: email, subject: title, html: emailHtml(title, body) });
+  if (error) throw new Error('Resend error: ' + error.message);
+}
+
+module.exports = { notify, notifyNewRfq, sendAccountDeletionEmail, sendAccountSuspensionEmail, sendAccountReactivationEmail };

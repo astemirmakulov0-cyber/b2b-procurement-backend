@@ -2,7 +2,7 @@ const prisma = require('../config/prisma');
 const bcrypt = require('bcryptjs');
 const crypto = require('crypto');
 const asyncHandler = require('../utils/asyncHandler');
-const { notify } = require('../utils/notify');
+const { notify, sendAccountSuspensionEmail, sendAccountReactivationEmail } = require('../utils/notify');
 const { CANCELLABLE_STATUSES, cancelRfqInTx } = require('../utils/rfqCancel');
 const Sentry = require('@sentry/node');
 const { DOC_TYPES, checkDocument, DOC_META } = require('../utils/documents');
@@ -210,4 +210,79 @@ const deleteCompany = asyncHandler(async (req, res) => {
   });
 });
 
-module.exports = { getMyCompany, updateMyCompany, addDocument, getCompanyDocument, listCompanies, setVerificationStatus, resetCompanyPassword, deleteCompany };
+const MAX_SUSPENSION_REASON = 500;
+
+// POST /api/admin/companies/:id/deactivate  body: { reason }  (admin)
+// Reversible, unlike DELETE (PDPL erasure/anonymize): the company keeps logging in and can still work on
+// orders already in flight (delivery, receipt, payments, documents, messages, disputes). It just cannot
+// post/edit RFQs, submit quotes or edit its catalog (enforced by requireNotSuspended), and its catalog is
+// hidden from other companies. Its own open RFQs are closed and pending quotes withdrawn, exactly like
+// self-service account erasure, but without touching the catalog, documents, wallet balance or identity.
+const deactivateCompany = asyncHandler(async (req, res) => {
+  const { id } = req.params;
+  const reason = typeof req.body.reason === 'string' ? req.body.reason.trim() : '';
+  if (!reason) return res.status(400).json({ error: 'reason is required' });
+  if (reason.length > MAX_SUSPENSION_REASON) return res.status(400).json({ error: `reason must be at most ${MAX_SUSPENSION_REASON} characters` });
+
+  const company = await prisma.company.findUnique({ where: { id }, include: { user: { select: { email: true } } } });
+  if (!company) return res.status(404).json({ error: 'Company not found' });
+  if (company.deletedAt) return res.status(400).json({ error: 'This account was deleted (PDPL erasure) and cannot be suspended' });
+  if (company.suspendedAt) return res.status(400).json({ error: 'Company is already suspended' });
+
+  await prisma.$transaction(async (tx) => {
+    const openRfqs = await tx.rFQ.findMany({ where: { buyerCompanyId: id, status: { in: CANCELLABLE_STATUSES } }, select: { id: true } });
+    for (const { id: rfqId } of openRfqs) {
+      await tx.$queryRaw`SELECT id FROM "RFQ" WHERE id = ${rfqId} FOR UPDATE`;
+      const rfq = await tx.rFQ.findUnique({ where: { id: rfqId } });
+      if (CANCELLABLE_STATUSES.includes(rfq.status)) await cancelRfqInTx(tx, rfq);
+    }
+
+    const pendingQuotes = await tx.quote.findMany({
+      where: { supplierCompanyId: id, status: { in: ['SUBMITTED', 'SHORTLISTED'] } },
+      select: { id: true, rfq: { select: { id: true, title: true, buyerCompanyId: true } } },
+    });
+    for (const quote of pendingQuotes) {
+      await tx.quote.update({ where: { id: quote.id }, data: { status: 'WITHDRAWN' } });
+      await tx.notification.create({
+        data: {
+          companyId: quote.rfq.buyerCompanyId,
+          type: 'QUOTE_WITHDRAWN',
+          title: 'A quote was withdrawn',
+          body: `A supplier's quote for "${quote.rfq.title}" was withdrawn because the supplier's account was suspended.`,
+        },
+      });
+    }
+
+    await tx.company.update({ where: { id }, data: { suspendedAt: new Date(), suspensionReason: reason } });
+  });
+
+  res.json({ ok: true });
+  notify(id, 'ACCOUNT_SUSPENDED', 'Account suspended', 'Reason: ' + reason);
+  if (company.user?.email) {
+    sendAccountSuspensionEmail(company.user.email, company.name, reason).catch((err) => {
+      console.error('Failed to send account suspension email:', err.message);
+      Sentry.captureException(err, { tags: { area: 'notify-email' }, extra: { companyId: id } });
+    });
+  }
+});
+
+// POST /api/admin/companies/:id/reactivate  (admin)
+const reactivateCompany = asyncHandler(async (req, res) => {
+  const { id } = req.params;
+  const company = await prisma.company.findUnique({ where: { id }, include: { user: { select: { email: true } } } });
+  if (!company) return res.status(404).json({ error: 'Company not found' });
+  if (!company.suspendedAt) return res.status(400).json({ error: 'Company is not suspended' });
+
+  await prisma.company.update({ where: { id }, data: { suspendedAt: null, suspensionReason: null } });
+
+  res.json({ ok: true });
+  notify(id, 'ACCOUNT_REACTIVATED', 'Account reactivated', undefined);
+  if (company.user?.email) {
+    sendAccountReactivationEmail(company.user.email, company.name).catch((err) => {
+      console.error('Failed to send account reactivation email:', err.message);
+      Sentry.captureException(err, { tags: { area: 'notify-email' }, extra: { companyId: id } });
+    });
+  }
+});
+
+module.exports = { getMyCompany, updateMyCompany, addDocument, getCompanyDocument, listCompanies, setVerificationStatus, resetCompanyPassword, deleteCompany, deactivateCompany, reactivateCompany };
