@@ -75,11 +75,9 @@ async function eraseAccountInTx(tx, user, company) {
   await tx.companyDocument.deleteMany({ where: { companyId } });
   await tx.notification.deleteMany({ where: { companyId } });
 
-  const wallet = await tx.wallet.findUnique({ where: { companyId }, select: { id: true } });
-  if (wallet) {
-    await tx.walletTransaction.deleteMany({ where: { walletId: wallet.id } });
-    await tx.wallet.delete({ where: { id: wallet.id } });
-  }
+  // Remaining credits are lost (the user is warned before confirming), but the transaction history
+  // (top-ups, bid debits, refunds) is bookkeeping, not personal data, and stays — only the balance is zeroed.
+  await tx.wallet.updateMany({ where: { companyId }, data: { balance: 0 } });
 
   await tx.company.update({
     where: { id: companyId },

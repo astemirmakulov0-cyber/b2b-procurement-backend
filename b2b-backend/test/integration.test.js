@@ -1817,7 +1817,9 @@ async function newRfq(budget = 500, extra = {}) {
 
   check('documents/catalog/notifications rows removed', (await db.companyDocument.count({ where: { companyId: 'pdplOk' } })) === 0 &&
     (await db.catalogItem.count({ where: { supplierCompanyId: 'pdplOk' } })) === 0 && (await db.notification.count({ where: { companyId: 'pdplOk' } })) === 0);
-  check('wallet (remaining credits) removed', !(await db.wallet.findUnique({ where: { companyId: 'pdplOk' } })));
+  const pdplWallet = await db.wallet.findUnique({ where: { companyId: 'pdplOk' } });
+  check('wallet balance zeroed (remaining credits lost), row kept', pdplWallet && Number(pdplWallet.balance) === 0, pdplWallet);
+  check('wallet transaction history (bid debit) kept, not deleted', (await db.walletTransaction.count({ where: { walletId: pdplWallet.id } })) > 0);
 
   const withdrawnQuote = await db.quote.findUnique({ where: { id: pdplQuote.id } });
   check('pending quote withdrawn, RFQ\'s buyer notified', withdrawnQuote.status === 'WITHDRAWN' &&
