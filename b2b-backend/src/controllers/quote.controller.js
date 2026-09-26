@@ -100,7 +100,7 @@ const listQuotesForRFQ = asyncHandler(async (req, res) => {
   const quotes = await prisma.quote.findMany({
     where,
     include: {
-      supplierCompany: { select: { id: true, name: true, verificationStatus: true } },
+      supplierCompany: { select: { id: true, name: true, isActive: true, verificationStatus: true } },
       // live attachments (a supplier only ever gets its own quote here)
       attachments: { where: { deletedAt: null }, select: ATTACHMENT_SELECT, orderBy: { createdAt: 'asc' } },
       // the LPO issued for this quote, with the supplier's reason if it was declined

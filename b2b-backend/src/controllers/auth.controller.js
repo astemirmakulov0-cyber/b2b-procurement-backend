@@ -7,6 +7,10 @@ const Sentry = require('@sentry/node');
 const { CANCELLABLE_STATUSES, cancelRfqInTx } = require('../utils/rfqCancel');
 const { normalizeEmail, emailError, passwordError } = require('../utils/credentials');
 const { DOC_META } = require('../utils/documents');
+const { getErasureBlockers, eraseAccountInTx } = require('../utils/accountErase');
+const { exportMyData } = require('../utils/accountExport');
+const { sendAccountDeletionEmail } = require('../utils/notify');
+const storage = require('../utils/storage');
 const { Resend } = require('resend');
 const resend = new Resend(process.env.RESEND_API_KEY);
 
@@ -206,7 +210,66 @@ const deleteAccount = asyncHandler(async (req, res) => {
 
   res.json({ ok: true, message: 'Account deactivated successfully', cancelledRfqs });
 });
- 
+
+// GET /api/auth/me/export  (PDPL: download my data)
+const exportData = asyncHandler(async (req, res) => {
+  const data = await exportMyData(prisma, req.user.id);
+  if (!data) return res.status(404).json({ error: 'User not found' });
+  res.set('Content-Disposition', 'attachment; filename="biddex-my-data.json"');
+  res.json(data);
+});
+
+// GET /api/auth/me/deletion-check  (PDPL: what would block "Delete account", and credits that would be lost)
+const deletionCheck = asyncHandler(async (req, res) => {
+  if (!req.user.companyId) return res.json({ blockers: [], walletBalance: '0.000' });
+  const result = await getErasureBlockers(prisma, req.user.companyId);
+  res.json(result);
+});
+
+// DELETE /api/auth/me/erase  (PDPL: erase my account — requires re-entering the password and the exact
+// company name). Blocked while anything is still in flight with a counterparty (see accountErase.js).
+// A confirmation email is sent to the still-live address before anything is anonymized. The DB changes are
+// one transaction; the now-orphaned bucket files (verification documents, catalog photos) are deleted after
+// it commits — a failure there is reported to Sentry but doesn't undo the erasure or fail the request.
+const eraseAccount = asyncHandler(async (req, res) => {
+  const { password, companyName } = req.body;
+  if (!password || !companyName) return res.status(400).json({ error: 'password and companyName are required' });
+
+  const user = await prisma.user.findUnique({ where: { id: req.user.id }, include: { company: true } });
+  if (!user) return res.status(404).json({ error: 'User not found' });
+  if (!user.company) return res.status(400).json({ error: 'No company to delete' });
+
+  const valid = await bcrypt.compare(password, user.passwordHash);
+  if (!valid) return res.status(401).json({ error: 'Current password is incorrect' });
+  if (companyName.trim() !== user.company.name.trim()) {
+    return res.status(400).json({ error: 'Company name does not match' });
+  }
+
+  const { blockers } = await getErasureBlockers(prisma, user.company.id);
+  if (blockers.length > 0) return res.status(409).json({ error: 'Account cannot be deleted yet', blockers });
+
+  // The real email still works here; deleteAccountInTx below replaces it with a sentinel address.
+  try {
+    await sendAccountDeletionEmail(user.email, user.company.name);
+  } catch (err) {
+    console.error('Failed to send account deletion email:', err.message);
+    Sentry.captureException(err, { tags: { area: 'notify-email' }, extra: { userId: user.id } });
+  }
+
+  const { storageKeys } = await prisma.$transaction((tx) => eraseAccountInTx(tx, user, user.company));
+
+  for (const key of storageKeys) {
+    try {
+      await storage.deleteObject(key);
+    } catch (err) {
+      console.error('Failed to delete bucket object after account erasure:', key, err.message);
+      Sentry.captureException(err, { tags: { area: 'storage' }, extra: { companyId: user.company.id, key } });
+    }
+  }
+
+  res.json({ ok: true, message: 'Account deleted. Your personal data has been erased.' });
+});
+
 // GET /api/auth/verify?token=...
 const verifyEmail = asyncHandler(async (req, res) => {
   const { token } = req.query;
@@ -320,4 +383,4 @@ const resendVerification = asyncHandler(async (req, res) => {
   }
 });
 
-module.exports = { register, login, me, changePassword, deleteAccount, verifyEmail, forgotPassword, resetPassword, resendVerification };
+module.exports = { register, login, me, changePassword, deleteAccount, exportData, deletionCheck, eraseAccount, verifyEmail, forgotPassword, resetPassword, resendVerification };

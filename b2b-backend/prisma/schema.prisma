@@ -137,6 +137,10 @@ model Company {
   // email notification preferences (in-app notifications are never gated by these)
   emailNewRfq             Boolean @default(true)
   emailOtherNotifications Boolean @default(true)
+  // set when the company erased its own account (PDPL right to erasure). name/registrationNumber/country
+  // are kept (financial records shared with counterparties still need the legal entity's identity);
+  // phone/address/verificationNotes are cleared. isActive is false at the same time.
+  deletedAt        DateTime?
 
 }
 

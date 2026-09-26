@@ -24,7 +24,7 @@ const listMessages = asyncHandler(async (req, res) => {
 
   const messages = await prisma.message.findMany({
     where: { orderId: order.id },
-    include: { senderCompany: { select: { id: true, name: true } } },
+    include: { senderCompany: { select: { id: true, name: true, isActive: true } } },
     orderBy: { createdAt: 'asc' },
   });
   res.json(messages);
@@ -40,7 +40,7 @@ const sendMessage = asyncHandler(async (req, res) => {
 
   const message = await prisma.message.create({
     data: { orderId: order.id, senderCompanyId: req.user.companyId, body: body.trim() },
-    include: { senderCompany: { select: { id: true, name: true } } },
+    include: { senderCompany: { select: { id: true, name: true, isActive: true } } },
   });
 
   const recipientId = order.lpo.buyerCompanyId === req.user.companyId

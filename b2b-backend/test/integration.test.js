@@ -100,6 +100,10 @@ async function newRfq(budget = 500, extra = {}) {
       });
       return;
     }
+    if (q.method === 'DELETE') {
+      s3Store.delete(decodeURIComponent(u.pathname));
+      res.writeHead(204); return res.end();
+    }
     const obj = s3Store.get(decodeURIComponent(u.pathname));
     lastGets.push(u);
     if (!obj || !['GET', 'HEAD'].includes(q.method)) { res.writeHead(404); return res.end(); }
@@ -605,7 +609,7 @@ async function newRfq(budget = 500, extra = {}) {
   check('supplier GET /orders: buyer name', ordSupRow && ordSupRow.lpo.buyerCompany.name === 'Co buyer1');
   const detail = (await call('GET', `/orders/${mo.id}`, S2)).data;
   check('GET /orders/:id includes both company names', detail.lpo.buyerCompany.name === 'Co buyer1' && detail.lpo.supplierCompany.name === 'Co sup2');
-  check('company objects expose only id and name', Object.keys(ordBuyerRow.lpo.supplierCompany).sort().join() === 'id,name');
+  check('company objects expose only id, name, isActive', Object.keys(ordBuyerRow.lpo.supplierCompany).sort().join() === 'id,isActive,name');
   check('other supplier cannot read the order -> 403', (await call('GET', `/orders/${mo.id}`, S1)).status === 403);
 
   console.log('\n== 16. M16 notify() failures are reported ==');
@@ -1724,6 +1728,115 @@ async function newRfq(budget = 500, extra = {}) {
   // an already verified company can submit an updated verification document and stays verified
   r = await call('POST', '/companies/me/documents', S1, { fileUrl: dataUrl('application/pdf', PDF_BYTES), docType: 'TRADE_LICENSE' });
   check('verified company uploads an updated document -> 201, still VERIFIED', r.status === 201 && (await db.company.findUnique({ where: { id: 'sup1' } })).verificationStatus === 'VERIFIED');
+
+
+  console.log('\n== 19. PDPL: download my data / delete account ==');
+
+  // -- blocked while an order is still active (not received, not completed) --
+  await mkCo('pdplBlk', 'BUYER');
+  const PBLK = tok('BUYER', 'pdplBlk');
+  await makeOrder(60, S1, 'sup1', PBLK, { received: false });
+  r = await call('GET', '/auth/me/deletion-check', PBLK);
+  check('deletion-check: blocked by active order', r.status === 200 && r.data.blockers.length > 0, r.data);
+  r = await call('DELETE', '/auth/me/erase', PBLK, { companyName: 'Co pdplBlk', password: 'pw123456' });
+  check('erase blocked by active order -> 409 with reasons', r.status === 409 && r.data.blockers && r.data.blockers.length > 0, r.data);
+  check('company untouched after blocked attempt', (await db.company.findUnique({ where: { id: 'pdplBlk' } })).isActive === true);
+
+  // -- a buyer's own open RFQ is cancelled (refund + notice) on erasure --
+  await mkCo('pdplBuyer2', 'BUYER');
+  const PBUY2 = tok('BUYER', 'pdplBuyer2');
+  await db.wallet.update({ where: { companyId: 'sup1' }, data: { balance: 100 } });
+  const pbRfq = (await call('POST', '/rfqs', PBUY2, { title: 'pdplBuyer2 rfq', description: 'x', category: 'Restaurants & Cafés', quantity: 1, budget: 200, deadline: future(), publish: true })).data;
+  check('sup1 quotes pdplBuyer2 rfq (fee charged)', (await call('POST', `/rfqs/${pbRfq.id}/quotes`, S1, { price: 150 })).status === 201 && (await bal('sup1')) === 90);
+  r = await call('DELETE', '/auth/me/erase', PBUY2, { companyName: 'Co pdplBuyer2', password: 'pw123456' });
+  check('buyer erase -> 200', r.status === 200, r.data);
+  check('its open RFQ was cancelled', (await db.rFQ.findUnique({ where: { id: pbRfq.id } })).status === 'CANCELLED');
+  check('sup1 refunded on buyer erasure', (await bal('sup1')) === 100);
+
+  // -- full self-service erasure: own data, files in the bucket, a pending quote, and a completed order --
+  await mkCo('pdplOk', 'SUPPLIER', 57.5);
+  const POK = tok('SUPPLIER', 'pdplOk');
+  const okDoc = await call('POST', '/companies/me/documents', POK, { fileUrl: dataUrl('application/pdf', PDF_BYTES), docType: 'TRADE_LICENSE' });
+  check('pdplOk uploads a verification document -> 201', okDoc.status === 201, okDoc.data);
+  const okDocRow = await db.companyDocument.findUnique({ where: { id: okDoc.data.id } });
+  check('document stored in the bucket', s3Store.has('/test-bucket/' + okDocRow.storageKey));
+
+  const okItem = await call('POST', '/catalog', POK, { name: 'pdplOk item', price: 5, imageUrl: dataUrl('image/jpeg', JPG_BYTES) });
+  check('pdplOk creates a catalog item with a photo -> 201', okItem.status === 201, okItem.data);
+  const okItemRow = await db.catalogItem.findUnique({ where: { id: okItem.data.id } });
+  check('catalog photo stored in the bucket', s3Store.has('/test-bucket/' + okItemRow.imageKey));
+
+  const pdplRfq = await newRfq(300);
+  await call('POST', `/rfqs/${pdplRfq.id}/quotes`, POK, { price: 200 });
+  const pdplQuote = await db.quote.findFirst({ where: { rfqId: pdplRfq.id, supplierCompanyId: 'pdplOk' } });
+  check('pdplOk quote SUBMITTED before erasure', pdplQuote && pdplQuote.status === 'SUBMITTED');
+
+  // a completed, paid order with a counterparty (buyer1): must survive erasure, without pdplOk's personal data
+  const { order: okOrder, invoice: okInvoice } = await makeOrder(45, POK, 'pdplOk', B1, { received: true });
+  const okPay = (await call('POST', `/invoices/${okInvoice.id}/payments`, B1, { amount: 45, method: 'cash' })).data.payment;
+  const okConfirm = await call('PATCH', `/payments/${okPay.id}/confirm`, POK, {});
+  check('order paid + received -> COMPLETED before erasure', okConfirm.status === 200 && (await db.order.findUnique({ where: { id: okOrder.id } })).status === 'COMPLETED', okConfirm.data);
+  // makeOrder topped up pdplOk's wallet to pay for RFQ/quote fees along the way; set it back to the
+  // balance under test for the "remaining credits will be lost" warning below
+  await db.wallet.update({ where: { companyId: 'pdplOk' }, data: { balance: 57.5 } });
+
+  // -- export: only pdplOk's own data, counterparties limited to id/name (nothing beyond what the UI shows) --
+  r = await call('GET', '/auth/me/export', POK);
+  check('export -> 200, own profile and company', r.status === 200 && r.data.company.id === 'pdplOk' && r.data.profile.email === 'pdplOk@t.test', r.data);
+  check('export: document listed by type/date only, no storage key or link', r.data.uploadedFiles.verificationDocuments.length === 1 &&
+    r.data.uploadedFiles.verificationDocuments[0].docType === 'TRADE_LICENSE' &&
+    !('storageKey' in r.data.uploadedFiles.verificationDocuments[0]) && !('url' in r.data.uploadedFiles.verificationDocuments[0]));
+  check('export: catalog item listed, no imageKey/imageUrl', r.data.catalogItems.length === 1 && !('imageKey' in r.data.catalogItems[0]) && !('imageUrl' in r.data.catalogItems[0]));
+  const expQuote = r.data.quotesSubmitted.find((q) => q.id === pdplQuote.id);
+  check('export: own quote listed, counterparty (buyer) limited to id+name', !!expQuote &&
+    Object.keys(expQuote.rfq.buyerCompany).sort().join(',') === 'id,name');
+  const expLpoAsSup = r.data.purchaseOrders.asSupplier.find((l) => l.order && l.order.id === okOrder.id);
+  check('export: purchase order as supplier included, buyer limited to id+name', !!expLpoAsSup &&
+    Object.keys(expLpoAsSup.buyerCompany).sort().join(',') === 'id,name');
+  check('export: no other company\'s own data (a sibling supplier\'s catalog item name) leaked in', !JSON.stringify(r.data).includes('sup6 item'));
+
+  r = await call('GET', '/auth/me/deletion-check', POK);
+  check('deletion-check: no blockers, wallet balance reported', r.status === 200 && r.data.blockers.length === 0 && r.data.walletBalance === '57.500', r.data);
+
+  check('erase with wrong password -> 401, nothing changed', (await call('DELETE', '/auth/me/erase', POK, { companyName: 'Co pdplOk', password: 'wrong' })).status === 401);
+  check('erase with wrong company name -> 400, nothing changed', (await call('DELETE', '/auth/me/erase', POK, { companyName: 'Not It', password: 'pw123456' })).status === 400);
+  check('company still active after failed confirmations', (await db.company.findUnique({ where: { id: 'pdplOk' } })).isActive === true);
+
+  sentEmails.length = 0;
+  r = await call('DELETE', '/auth/me/erase', POK, { companyName: 'Co pdplOk', password: 'pw123456' });
+  check('erase succeeds -> 200', r.status === 200, r.data);
+
+  const delMail = sentEmails.find((m) => m.to === 'pdplOk@t.test' && /deleted/i.test(m.subject));
+  check('deletion confirmation email sent to the still-live address before anonymization', !!delMail, delMail);
+
+  const pdplCo = await db.company.findUnique({ where: { id: 'pdplOk' }, include: { user: true } });
+  check('company: name/CR/country kept (needed by counterparties\' records), phone/address/verificationNotes cleared, isActive false, deletedAt set',
+    pdplCo.name === 'Co pdplOk' && pdplCo.registrationNumber === 'CR-pdplOk' && pdplCo.phone === null && pdplCo.address === null &&
+    pdplCo.verificationNotes === null && pdplCo.isActive === false && pdplCo.deletedAt !== null, pdplCo);
+  check('user: email replaced with a sentinel, password unusable, deactivated', pdplCo.user.email.endsWith('@deleted.invalid') && pdplCo.user.passwordHash === '!' && pdplCo.user.isActive === false);
+
+  check('documents/catalog/notifications rows removed', (await db.companyDocument.count({ where: { companyId: 'pdplOk' } })) === 0 &&
+    (await db.catalogItem.count({ where: { supplierCompanyId: 'pdplOk' } })) === 0 && (await db.notification.count({ where: { companyId: 'pdplOk' } })) === 0);
+  check('wallet (remaining credits) removed', !(await db.wallet.findUnique({ where: { companyId: 'pdplOk' } })));
+
+  const withdrawnQuote = await db.quote.findUnique({ where: { id: pdplQuote.id } });
+  check('pending quote withdrawn, RFQ\'s buyer notified', withdrawnQuote.status === 'WITHDRAWN' &&
+    (await db.notification.count({ where: { companyId: 'buyer1', type: 'QUOTE_WITHDRAWN' } })) > 0);
+
+  check('completed order/invoice/payment kept for accounting, without pdplOk\'s personal data attached',
+    !!(await db.order.findUnique({ where: { id: okOrder.id } })) &&
+    (await db.invoice.findUnique({ where: { id: okInvoice.id } })).status === 'PAID' &&
+    (await db.payment.findUnique({ where: { id: okPay.id } })).status === 'COMPLETED');
+  const okOrderAfter = await call('GET', `/orders/${okOrder.id}`, B1);
+  check('counterparty (buyer1) still opens the order; supplier shown as inactive', okOrderAfter.status === 200 &&
+    okOrderAfter.data.lpo.supplierCompany.id === 'pdplOk' && okOrderAfter.data.lpo.supplierCompany.isActive === false, okOrderAfter.data.lpo);
+
+  await new Promise((res) => setTimeout(res, 100)); // bucket deletes happen after the DB transaction commits
+  check('verification document deleted from the bucket', !s3Store.has('/test-bucket/' + okDocRow.storageKey));
+  check('catalog photo deleted from the bucket', !s3Store.has('/test-bucket/' + okItemRow.imageKey));
+
+  check('login impossible after erasure (wrong password)', (await call('POST', '/auth/login', null, { email: 'pdplOk@t.test', password: 'pw123456' })).status !== 200);
+  check('old token rejected immediately after erasure', (await call('GET', '/auth/me', POK)).status === 401);
 
   s3Server.close(); // the local S3 stand-in serves every section above
 

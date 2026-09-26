@@ -6,7 +6,7 @@
 //   S3_ENDPOINT, S3_REGION, S3_BUCKET, S3_ACCESS_KEY_ID, S3_SECRET_ACCESS_KEY
 //   S3_FORCE_PATH_STYLE=true only for endpoints without virtual-hosted buckets (the local test server)
 const crypto = require('crypto');
-const { S3Client, PutObjectCommand, GetObjectCommand, HeadObjectCommand } = require('@aws-sdk/client-s3');
+const { S3Client, PutObjectCommand, GetObjectCommand, HeadObjectCommand, DeleteObjectCommand } = require('@aws-sdk/client-s3');
 const { getSignedUrl } = require('@aws-sdk/s3-request-presigner');
 
 const DOWNLOAD_URL_TTL_SECONDS = 120;
@@ -80,6 +80,13 @@ async function presignStable(key, contentType, now = Date.now()) {
   return getSignedUrl(s3(), cmd, { expiresIn: STABLE_URL_TTL_SECONDS, signingDate });
 }
 
+// Permanently removes an object. Only used for PDPL erasure (verification documents, catalog photos of a
+// company that deleted its own account) — never for the shared/order-related files this module's header
+// comment says are "never overwritten or deleted".
+async function deleteObject(key) {
+  await s3().send(new DeleteObjectCommand({ Bucket: config().bucket, Key: key }));
+}
+
 // { size } of a stored object, or null if it doesn't exist
 async function headObject(key) {
   try {
@@ -92,6 +99,6 @@ async function headObject(key) {
 }
 
 module.exports = {
-  isConfigured, newKey, putObject, presignDownload, presignView, presignStable, headObject, attachmentDisposition,
+  isConfigured, newKey, putObject, presignDownload, presignView, presignStable, headObject, deleteObject, attachmentDisposition,
   DOWNLOAD_URL_TTL_SECONDS, STABLE_URL_TTL_SECONDS,
 };

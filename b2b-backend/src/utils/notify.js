@@ -97,4 +97,15 @@ async function notifyNewRfq(title, body) {
   }
 }
 
-module.exports = { notify, notifyNewRfq };
+// Sent right before an account is erased (PDPL "Delete account"), while the real email address still
+// works. Always sent, regardless of emailOtherNotifications — the user needs to know it happened even if
+// they opted out of other email. Awaited by the caller so the account isn't wiped before it's out the door;
+// a send failure is reported but never blocks the deletion itself.
+async function sendAccountDeletionEmail(email, companyName) {
+  const title = 'Your Biddex account has been deleted';
+  const body = `The account for "${companyName}" and its personal data have been erased, as requested. Purchase orders, invoices and payments already shared with other companies are kept for accounting purposes, without your personal details.`;
+  const { error } = await resend.emails.send({ from: FROM, to: email, subject: title, html: emailHtml(title, body) });
+  if (error) throw new Error('Resend error: ' + error.message);
+}
+
+module.exports = { notify, notifyNewRfq, sendAccountDeletionEmail };

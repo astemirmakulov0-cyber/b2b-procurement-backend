@@ -17,7 +17,7 @@ const CLOSED_ORDER_STATUSES = ['COMPLETED', 'CANCELLED'];
 // what the API shows about a document (never the storage key)
 const DOC_SELECT = {
   id: true, orderId: true, kind: true, fileName: true, contentType: true, sizeBytes: true, createdAt: true,
-  uploadedByCompanyId: true, uploadedByCompany: { select: { id: true, name: true } },
+  uploadedByCompanyId: true, uploadedByCompany: { select: { id: true, name: true, isActive: true } },
 };
 
 // The caller's role in the order: 'buyer' | 'supplier' | 'admin' (admins read only), or an error

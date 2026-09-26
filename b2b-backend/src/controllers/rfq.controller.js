@@ -128,8 +128,8 @@ const getRFQ = asyncHandler(async (req, res) => {
   const rfq = await prisma.rFQ.findUnique({
     where: { id: req.params.id },
     include: {
-      quotes: { include: { supplierCompany: { select: { id: true, name: true } } } },
-      buyerCompany: { select: { id: true, name: true } },
+      quotes: { include: { supplierCompany: { select: { id: true, name: true, isActive: true } } } },
+      buyerCompany: { select: { id: true, name: true, isActive: true } },
     },
   });
   if (!rfq) return res.status(404).json({ error: 'RFQ not found' });

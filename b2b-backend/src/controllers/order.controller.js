@@ -7,7 +7,7 @@ async function loadOrderWithAccessCheck(orderId, user) {
     where: { id: orderId },
     include: {
       lpo: { include: {
-        buyerCompany: { select: { id: true, name: true } }, supplierCompany: { select: { id: true, name: true } }, rfq: { select: { title: true } },
+        buyerCompany: { select: { id: true, name: true, isActive: true } }, supplierCompany: { select: { id: true, name: true, isActive: true } }, rfq: { select: { title: true } },
       } },
       delivery: true, invoice: { include: { payments: true } },
     },
@@ -32,7 +32,7 @@ const listOrders = asyncHandler(async (req, res) => {
     include: {
       lpo: { select: {
         id: true, totalAmount: true, rfq: { select: { title: true } },
-        buyerCompany: { select: { id: true, name: true } }, supplierCompany: { select: { id: true, name: true } },
+        buyerCompany: { select: { id: true, name: true, isActive: true } }, supplierCompany: { select: { id: true, name: true, isActive: true } },
       } },
       delivery: true, invoice: true,
     },
@@ -147,7 +147,7 @@ const listOrdersAdmin = asyncHandler(async (req, res) => {
     include: {
       lpo: { select: {
         id: true, totalAmount: true, buyerCompanyId: true, rfq: { select: { title: true } },
-        buyerCompany: { select: { id: true, name: true } }, supplierCompany: { select: { id: true, name: true } },
+        buyerCompany: { select: { id: true, name: true, isActive: true } }, supplierCompany: { select: { id: true, name: true, isActive: true } },
       } },
       delivery: true, invoice: true,
     },
