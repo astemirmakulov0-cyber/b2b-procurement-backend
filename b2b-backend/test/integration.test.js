@@ -2231,6 +2231,21 @@ async function newRfq(budget = 500, extra = {}) {
     await settle();
     check('running the check again does not double-notify', (await notesOf('buyer1', 'INVOICE_OVERDUE')).length === buyerNotesBefore && sentEmails.length === 0);
 
+    // an OVERDUE invoice can still be paid: record payment -> supplier confirms -> PAID
+    r = await call('POST', `/invoices/${inv45.id}/payments`, B1, { amount: Number(inv45.amount), method: 'bank_transfer' });
+    check('recording a payment on an OVERDUE invoice -> 201', r.status === 201, r.data);
+    const pendingPaymentId = r.data.payment.id;
+    // running the overdue check with a payment still PENDING confirmation must not touch the invoice
+    // (it's excluded from candidates once it's OVERDUE, and a pending payment never resets a status by itself)
+    await checkOverdueInvoices();
+    inv45 = await db.invoice.findUnique({ where: { id: inv45.id } });
+    check('invoice stays OVERDUE while the payment is still pending confirmation', inv45.status === 'OVERDUE', inv45);
+    r = await call('PATCH', `/payments/${pendingPaymentId}/confirm`, S1, {});
+    check('supplier confirms the payment -> 200', r.status === 200, r.data);
+    inv45 = await db.invoice.findUnique({ where: { id: inv45.id } });
+    check('a fully confirmed payment moves an OVERDUE invoice to PAID', inv45.status === 'PAID', inv45);
+    check('the order completes once paid and received', (await db.order.findUnique({ where: { id: acc45.data.order.id } })).status === 'COMPLETED');
+
     // an invoice that never had receipt confirmed (dueDate null) can never become overdue
     const { order: noReceiptOrder, invoice: noReceiptInvoice } = await makeOrder(20, S2, 'sup2');
     check('invoice with no dueDate stays as-is before the check', noReceiptInvoice.dueDate === null && noReceiptInvoice.status === 'ISSUED');
